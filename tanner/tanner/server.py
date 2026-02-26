@@ -2,14 +2,15 @@ import asyncio
 import json
 import logging
 import yarl
+import uuid
 
 from aiohttp import web
 
 from tanner import dorks_manager, redis_client
 from tanner.sessions import session_manager
-from tanner.policy.policy_engine import PolicyEngine
 from tanner.config import TannerConfig
 from tanner.emulators import base
+from tanner.generator import base_generator
 from tanner.reporting.log_local import Reporting as local_report
 from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
@@ -27,6 +28,7 @@ class TannerServer:
         self.base_handler = base.BaseHandler(base_dir, db_name)
         self.logger = logging.getLogger(__name__)
         self.redis_client = None
+        self.generator = base_generator.BaseGenerator() 
 
         if TannerConfig.get("HPFEEDS", "enabled") is True:
             self.hpf = hpfeeds_report()
@@ -44,6 +46,12 @@ class TannerServer:
     async def default_handler(request):
         return web.Response(text="Tanner server")
 
+    async def _run_meta_job(self, job_id, session, data):
+        try:
+            await self.generator.generate_page(job_id, data)
+        except Exception:
+            self.logger.exception("Meta job generation failed for %s", job_id)
+
     async def handle_event(self, request):
         data = await request.read()
         try:
@@ -59,13 +67,19 @@ class TannerServer:
             detection = await self.base_handler.handle(data, session)
             session.set_attack_type(path, detection["name"])
 
-            decision = self.policy_engine.decide(session=session, path=path, data=data)
+            meta_job_id = None
+            meta_hit = bool(data.get("meta_probe", {}).get("hit", False))
+            if not meta_hit:
+                meta_job_id = str(uuid.uuid4())
+                asyncio.create_task(self._run_meta_job(meta_job_id, session, data))
+                detection["type"] = 3
+                detection["payload"] = {"status_code": 404}
 
-            if decision.override_detection:
-                detection = decision.detection
-            else:
-                detection = await self.base_handler.handle(data, session)
-            response_msg = self._make_response(msg=dict(detection=detection, sess_uuid=session.get_uuid()))
+            response_message = dict(detection=detection, sess_uuid=session.get_uuid())
+            if meta_job_id is not None:
+                response_message["meta_job_id"] = meta_job_id
+
+            response_msg = self._make_response(msg=response_message)
             self.logger.info("TANNER response %s", response_msg)
 
             session_data = data

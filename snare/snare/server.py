@@ -5,7 +5,7 @@ import jinja2
 
 from aiohttp import web
 from aiohttp.web import StaticResource as StaticRoute
-
+from urllib.parse import unquote
 from snare.middlewares import SnareMiddleware
 from snare.tanner_handler import TannerHandler
 
@@ -38,6 +38,66 @@ class HttpRequestHandler:
     async def handle_request(self, request):
         self.logger.info("Request path: {0}".format(request.path_qs))
         data = self.tanner_handler.create_data(request, 200)
+        
+        # Meta Probe Logic
+        base_path = request.path
+        if not base_path.startswith("/"):
+            base_path = "/" + base_path
+
+        index_page = getattr(self.run_args, "index_page", "/index.html")
+        if not index_page.startswith("/"):
+            index_page = "/" + index_page
+
+        candidates = []
+        seen = set()
+
+        def add(path: str):
+            if not path:
+                return
+
+            normalized_path = path if path.startswith("/") else "/" + path
+            if normalized_path not in seen:
+                seen.add(normalized_path)
+                candidates.append(normalized_path)
+
+        # Account for root -> index page, and trailing slash + directory index variants.
+        def add_path_variants(path: str):
+            add(path)
+            if path == "/":
+                add(index_page)
+                return
+
+            if path.endswith("/"):
+                trimmed_path = path[:-1] or "/"
+                add(trimmed_path)
+                add((trimmed_path if trimmed_path != "/" else "") + index_page)
+                return
+
+            add(path + "/")
+            add(path + index_page)
+
+        # Variants of base path.
+        add_path_variants(base_path)
+
+        # Variants of unquoted path.
+        add_path_variants(unquote(base_path))
+
+        matched_key = None
+        hit = False
+        if isinstance(self.meta, dict):
+            for c in candidates:
+                if c in self.meta:
+                    matched_key = c
+                    hit = True
+                    break
+            
+        data["meta_probe"] = {
+            "hit": hit,
+            "matched_key": matched_key,
+            "candidates": candidates,
+            "index_page": index_page,
+        }
+
         if request.method == "POST":
             post_data = await request.post()
             self.logger.info("POST data:")

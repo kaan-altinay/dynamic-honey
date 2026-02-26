@@ -1,8 +1,8 @@
 version: '2.3'
 
 networks:
-  snare_local:
-
+  tanner_local:
+    external: true
 services:
 
 # Snare service
@@ -13,7 +13,8 @@ services:
     stop_signal: SIGKILL
     tty: true
     networks:
-     - snare_local
+     - tanner_local
     ports:
-     - "80:80"
-    image: "mushorg/snare:latest"
+     - "8080:80"
+    environment:
+     - TANNER=tanner

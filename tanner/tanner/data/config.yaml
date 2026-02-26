@@ -35,7 +35,7 @@ EMULATORS:
   root_dir: /opt/tanner
 
 EMULATOR_ENABLED: 
-  sqli: True
+  sqli: False
   rfi: True
   lfi: True 
   xss: True

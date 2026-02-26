@@ -6,7 +6,7 @@ import random
 import re
 import uuid
 
-import aioredis
+from redis import asyncio as aioredis
 
 from tanner import config
 from tanner.utils import patterns

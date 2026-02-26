@@ -44,10 +44,8 @@ class Api:
             self.logger.exception("Can not connect to redis %s", connection_error)
         else:
             if not query_res:
-                self.logger.warning("Invalid Snare UUID: %s", str(uuid))
                 return "Invalid SNARE UUID"
             for (i, val) in enumerate(query_res):
-                self.logger.warning("I am logging yey: %s", str(val))
                 query_res[i] = json.loads(val)
         return query_res
 

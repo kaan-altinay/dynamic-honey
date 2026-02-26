@@ -1,38 +1,44 @@
 version: '2.3'
 
 networks:
-  tanner_local:
 
+  tanner_local:
+    external: true
 services:
 
 # Tanner Redis Service
   tanner_redis:
     build: ./redis
+    image: tanner-redis-local
     container_name: tanner_redis
     restart: always
     stop_signal: SIGKILL
     tty: true
     networks:
      - tanner_local
-    image: "mushorg/redis:latest"
     read_only: true
+    tmpfs:
+     - /data
 
 # PHP Sandbox service
   tanner_phpox:
     build: ./phpox
+    image: tanner-phpox-local
     container_name: tanner_phpox
     restart: always
     stop_signal: SIGKILL
     tty: true
     networks:
      - tanner_local
-    image: "mushorg/phpox:latest"
     read_only: true
     tmpfs: "/tmp"
 
 # Tanner API Service
   tanner_api:
-    build: ./tanner
+    build:
+      context: ..
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
     environment:
       - PATH=/opt/tanner/tanner-env/bin/:$PATH
     container_name: tanner_api
@@ -44,7 +50,6 @@ services:
     tty: true
     networks:
      - tanner_local
-    image: "mushorg/tanner:latest"
     read_only: true
     command: tannerapi
     depends_on:
@@ -52,7 +57,10 @@ services:
 
 # Tanner WEB Service
   tanner_web:
-    build: ./tanner
+    build:
+      context: ..
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
     environment:
       - PATH=/opt/tanner/tanner-env/bin/:$PATH
     container_name: tanner_web
@@ -66,15 +74,18 @@ services:
      - tanner_local
     ports:
      - "8091:8091"
-    image: "mushorg/tanner:latest"
     command: tannerweb
     read_only: true
     depends_on:
+     - tanner_api
      - tanner_redis
 
 # Tanner Service
   tanner:
-    build: ./tanner
+    build:
+      context: ..
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
     environment:
       - PATH=/opt/tanner/tanner-env/bin/:$PATH
     container_name: tanner
@@ -87,9 +98,6 @@ services:
     tty: true
     networks:
      - tanner_local
-    ports:
-     - "8090:8090"
-    image: "mushorg/tanner:latest"
     command: tanner
     read_only: true
     depends_on:
