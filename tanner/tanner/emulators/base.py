@@ -81,7 +81,6 @@ class BaseHandler:
             "template_injection",
         ]
         self.cookie_emulators = ["sqli", "php_object_injection"]
-        self.generator = base_generator.BaseGenerator(self)
 
     def extract_get_data(self, path):
         """

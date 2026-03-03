@@ -73,7 +73,7 @@ services:
     networks:
      - tanner_local
     ports:
-     - "8091:8091"
+     - "127.0.0.1:8091:8091"
     command: tannerweb
     read_only: true
     depends_on:

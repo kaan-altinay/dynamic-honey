@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import aiohttp
 import aiohttp_jinja2
@@ -107,14 +108,17 @@ class HttpRequestHandler:
 
         # Submit the event to the TANNER service
         event_result = await self.tanner_handler.submit_data(data)
+        event_message = event_result.get("response", {}).get("message", {}) if event_result else {}
+        meta_job_id = event_message.get("meta_job_id")
+        if meta_job_id:
+            asyncio.create_task(self.tanner_handler.poll_meta_job(meta_job_id, request.path_qs))
 
         # Log the event to slurp service if enabled
         if self.run_args.slurp_enabled:
             await self.submit_slurp(request.path_qs)
 
-        content, headers, status_code = await self.tanner_handler.parse_tanner_response(
-            request.path_qs, event_result["response"]["message"]["detection"]
-        )
+        detection = event_message.get("detection", {"name": "index", "order": 1, "type": 1})
+        content, headers, status_code = await self.tanner_handler.parse_tanner_response(request.path_qs, detection)
 
         if self.run_args.server_header:
             headers["Server"] = self.run_args.server_header

@@ -11,16 +11,20 @@ from tanner.config import TannerConfig
 
 class SessionAnalyzer:
     def __init__(self, loop=None):
-        self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._loop = loop
         self.queue = asyncio.Queue()
         self.logger = logging.getLogger("tanner.session_analyzer.SessionAnalyzer")
         self.attacks = ["sqli", "rfi", "lfi", "xss", "php_code_injection", "cmd_exec", "crlf"]
+
+    def _get_executor_loop(self):
+        running_loop = asyncio.get_running_loop()
+        return running_loop if self._loop is None or self._loop is not running_loop else self._loop
 
     async def analyze(self, session_key, redis_client):
         session = None
         await asyncio.sleep(1)
         try:
-            session = await redis_client.get(session_key, encoding="utf-8")
+            session = await redis_client.get(session_key)
             session = json.loads(session)
         except (aioredis.ConnectionError, TypeError, ValueError) as error:
             self.logger.exception("Can't get session for analyze: %s", error)
@@ -35,11 +39,11 @@ class SessionAnalyzer:
             s_key = session["snare_uuid"]
             del_key = session["sess_uuid"]
             try:
-                await redis_client.zadd(s_key, session["start_time"], json.dumps(session))
-                await redis_client.delete(*[del_key])
+                await redis_client.zadd(s_key, {json.dumps(session): session["start_time"]})
+                await redis_client.delete(del_key)
             except aioredis.ConnectionError as redis_error:
                 self.logger.exception("Error with redis. Session will be returned to the queue: %s", redis_error)
-                self.queue.put(session)
+                await self.queue.put(session)
 
     async def create_stats(self, session, redis_client):
         sess_duration = session["end_time"] - session["start_time"]
@@ -48,7 +52,7 @@ class SessionAnalyzer:
             rps = session["count"] / sess_duration
         else:
             rps = 0
-        location_info = await self._loop.run_in_executor(None, self.find_location, session["peer"]["ip"])
+        location_info = await self._get_executor_loop().run_in_executor(None, self.find_location, session["peer"]["ip"])
         tbr, errors, hidden_links, attack_types = await self.analyze_paths(session["paths"], redis_client)
         attack_count = self.set_attack_count(attack_types)
 
@@ -115,7 +119,7 @@ class SessionAnalyzer:
         if stats["peer_ip"] == "127.0.0.1" or stats["peer_ip"] == "::1":
             possible_owners["admin"] = 1.0
         with open(TannerConfig.get("DATA", "crawler_stats")) as f:
-            bots_owner = await self._loop.run_in_executor(None, f.read)
+            bots_owner = await self._get_executor_loop().run_in_executor(None, f.read)
         crawler_hosts = ["googlebot.com", "baiduspider", "search.msn.com", "spider.yandex.com", "crawl.sogou.com"]
         possible_owners["crawler"], possible_owners["tool"] = await self.detect_crawler(
             stats, bots_owner, crawler_hosts
@@ -154,7 +158,7 @@ class SessionAnalyzer:
                 return (0.85, 0.15)
             return (0.5, 0.85)
         if stats["user_agent"] is not None and stats["user_agent"] in bots_owner:
-            hostname, _, _ = await self._loop.run_in_executor(None, socket.gethostbyaddr, stats["peer_ip"])
+            hostname, _, _ = await self._get_executor_loop().run_in_executor(None, socket.gethostbyaddr, stats["peer_ip"])
             if hostname is not None:
                 for crawler_host in crawler_hosts:
                     if crawler_host in hostname:
@@ -168,7 +172,7 @@ class SessionAnalyzer:
         if stats["requests_in_second"] > 10:
             return 0.0
         if stats["user_agent"] is not None and stats["user_agent"] in bots_owner:
-            hostname, _, _ = await self._loop.run_in_executor(None, socket.gethostbyaddr, stats["peer_ip"])
+            hostname, _, _ = await self._get_executor_loop().run_in_executor(None, socket.gethostbyaddr, stats["peer_ip"])
             if hostname is not None:
                 for crawler_host in crawler_hosts:
                     if crawler_host in hostname:

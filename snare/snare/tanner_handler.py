@@ -1,3 +1,6 @@
+import asyncio
+import base64
+import hashlib
 import re
 import os
 import multidict
@@ -18,6 +21,7 @@ class TannerHandler:
         self.snare_uuid = snare_uuid
         self.html_handler = HtmlHandler(run_args.no_dorks, run_args.tanner)
         self.logger = logging.getLogger(__name__)
+        self._meta_lock = asyncio.Lock()
 
     def create_data(self, request, response_status):
         data = dict(
@@ -81,6 +85,103 @@ class TannerHandler:
             self.logger.exception("Exception: %s", e)
             raise e
         return event_result
+
+    @staticmethod
+    def _normalize_headers(headers):
+        if isinstance(headers, dict):
+            return [{key: value} for key, value in headers.items()]
+        if isinstance(headers, list):
+            normalized_headers = []
+            for header in headers:
+                if isinstance(header, dict):
+                    normalized_headers.append(header)
+            return normalized_headers
+        return []
+
+    def _normalize_meta_path(self, requested_path):
+        normalized_path = requested_path.split("?", 1)[0]
+        normalized_path = unquote(normalized_path)
+        if not normalized_path.startswith("/"):
+            normalized_path = "/" + normalized_path
+        if normalized_path == "/":
+            return getattr(self.run_args, "index_page", "/index.html")
+        if normalized_path.endswith("/"):
+            return normalized_path[:-1]
+        return normalized_path
+
+    async def _save_generated_meta(self, requested_path, headers, body_bytes):
+        content_hash = hashlib.md5(body_bytes).hexdigest()
+        content_file = os.path.join(self.dir, content_hash)
+        with open(content_file, "wb") as generated_content:
+            generated_content.write(body_bytes)
+
+        meta_key = self._normalize_meta_path(requested_path)
+        normalized_headers = self._normalize_headers(headers)
+
+        async with self._meta_lock:
+            self.meta[meta_key] = {"hash": content_hash, "headers": normalized_headers}
+            meta_path = os.path.join(self.dir, "meta.json")
+            temp_meta_path = "{}.tmp".format(meta_path)
+            with open(temp_meta_path, "w") as meta_file:
+                json.dump(self.meta, meta_file)
+            os.replace(temp_meta_path, meta_path)
+
+    async def poll_meta_job(self, meta_job_id, requested_path, poll_interval=1.0, max_attempts=30):
+        endpoint = "http://{0}:8090/meta_job/{1}".format(self.run_args.tanner, meta_job_id)
+        async with aiohttp.ClientSession() as session:
+            for _ in range(max_attempts):
+                try:
+                    async with session.get(endpoint, timeout=10.0) as response:
+                        if response.status == 404:
+                            self.logger.warning("Meta job %s not found", meta_job_id)
+                            return False
+
+                        response_data = await response.json()
+                except (
+                    json.decoder.JSONDecodeError,
+                    aiohttp.client_exceptions.ContentTypeError,
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError,
+                ) as error:
+                    self.logger.warning("Polling meta job %s failed: %s", meta_job_id, error)
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                message = response_data.get("response", {}).get("message", {})
+                state = message.get("state")
+                if response.status == 202 or state == "pending":
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                if state == "ready":
+                    body_b64 = message.get("body_b64")
+                    if not body_b64:
+                        self.logger.warning("Meta job %s returned ready state without body", meta_job_id)
+                        return False
+
+                    try:
+                        body_bytes = base64.b64decode(body_b64)
+                    except ValueError as error:
+                        self.logger.warning("Meta job %s body decode failed: %s", meta_job_id, error)
+                        return False
+
+                    await self._save_generated_meta(
+                        requested_path=message.get("path", requested_path),
+                        headers=message.get("headers", []),
+                        body_bytes=body_bytes,
+                    )
+                    self.logger.info("Stored generated meta content for path %s", requested_path)
+                    return True
+
+                if state == "failed":
+                    self.logger.warning("Meta job %s failed: %s", meta_job_id, message.get("error"))
+                    return False
+
+                self.logger.warning("Meta job %s returned unexpected state payload: %s", meta_job_id, message)
+                return False
+
+        self.logger.warning("Meta job %s timed out after %s attempts", meta_job_id, max_attempts)
+        return False
 
     async def parse_tanner_response(self, requested_name, detection):
         content = None
