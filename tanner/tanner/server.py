@@ -11,7 +11,7 @@ from tanner import dorks_manager, redis_client
 from tanner.sessions import session_manager
 from tanner.config import TannerConfig
 from tanner.emulators import base
-from tanner.generator import base_generator
+from tanner.generator import base_generator, local_qwen_generator
 from tanner.reporting.log_local import Reporting as local_report
 from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
@@ -29,7 +29,7 @@ class TannerServer:
         self.base_handler = base.BaseHandler(base_dir, db_name)
         self.logger = logging.getLogger(__name__)
         self.redis_client = None
-        self.generator = base_generator.BaseGenerator() 
+        self.generator = self._build_generator()
 
         if TannerConfig.get("HPFEEDS", "enabled") is True:
             self.hpf = hpfeeds_report()
@@ -37,6 +37,17 @@ class TannerServer:
 
             if self.hpf.connected() is False:
                 self.logger.warning("hpfeeds not connected - no hpfeeds messages will be created")
+
+    def _build_generator(self):
+        try:
+            backend = TannerConfig.get("GENERATOR", "backend")
+        except KeyError:
+            backend = None
+
+        if isinstance(backend, str) and backend.strip().lower() == "local_qwen":
+            self.logger.info("Using LocalQwenGenerator backend")
+            return local_qwen_generator.LocalQwenGenerator()
+        return base_generator.BaseGenerator()
 
     @staticmethod
     def _make_response(msg):

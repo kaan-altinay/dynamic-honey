@@ -31,6 +31,16 @@ REDIS:
   poolsize: 80 
   timeout: 1
 
+
+GENERATOR:
+  backend: none
+  endpoint: http://127.0.0.1:8000/v1/chat/completions
+  model: qwen-local
+  timeout: 60
+  retries: 2
+  temperature: 0.15
+  max_tokens: 700
+
 EMULATORS:
   root_dir: /opt/tanner
 
