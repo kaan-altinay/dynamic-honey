@@ -109,6 +109,105 @@ class TannerHandler:
             return normalized_path[:-1]
         return normalized_path
 
+    def parse_seed_endpoints(self, seed_endpoints_path):
+        if not seed_endpoints_path:
+            return []
+
+        parsed_endpoints = []
+        seen = set()
+        with open(seed_endpoints_path) as seed_fh:
+            for endpoint in seed_fh:
+                endpoint = endpoint.strip()
+                if not endpoint or endpoint.startswith("#"):
+                    continue
+
+                normalized_endpoint = self._normalize_meta_path(endpoint)
+                if normalized_endpoint in seen:
+                    continue
+                seen.add(normalized_endpoint)
+                parsed_endpoints.append(normalized_endpoint)
+        return parsed_endpoints
+
+    async def _request_meta_generate_job(self, requested_path):
+        host = getattr(self.run_args, "host_ip", None)
+        if not isinstance(host, str) or not host.strip():
+            host = None
+
+        payload = {
+            "path": requested_path,
+            "index_page": getattr(self.run_args, "index_page", "/index.html"),
+            "site_profile": {
+                "index_page": getattr(self.run_args, "index_page", "/index.html"),
+                "candidates": [requested_path],
+            },
+        }
+        if host is not None:
+            payload["host"] = host
+
+        endpoint = "http://{0}:8090/meta_generate".format(self.run_args.tanner)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, json=payload, timeout=10.0) as response:
+                    try:
+                        response_data = await response.json()
+                    except (
+                        json.decoder.JSONDecodeError,
+                        aiohttp.client_exceptions.ContentTypeError,
+                    ) as error:
+                        self.logger.warning(
+                            "Seed endpoint %s meta_generate response decode failed: %s",
+                            requested_path,
+                            error,
+                        )
+                        return None
+
+                    if response.status >= 400:
+                        self.logger.warning(
+                            "Seed endpoint %s meta_generate returned status %s: %s",
+                            requested_path,
+                            response.status,
+                            response_data,
+                        )
+                        return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            self.logger.warning("Seed endpoint %s meta_generate request failed: %s", requested_path, error)
+            return None
+
+        message = response_data.get("response", {}).get("message", {}) if isinstance(response_data, dict) else {}
+        return message.get("meta_job_id")
+
+    async def consume_seed_endpoints(self, seed_endpoints):
+        summary = {"requested": 0, "skipped": 0, "generated": 0, "failed": 0}
+        if not seed_endpoints:
+            return summary
+
+        for endpoint in seed_endpoints:
+            requested_path = self._normalize_meta_path(endpoint)
+            summary["requested"] += 1
+
+            if requested_path in self.meta:
+                summary["skipped"] += 1
+                continue
+
+            meta_job_id = await self._request_meta_generate_job(requested_path)
+            if not meta_job_id:
+                self.logger.warning("Seed endpoint %s did not return meta job id", requested_path)
+                summary["failed"] += 1
+                continue
+
+            try:
+                is_generated = await self.poll_meta_job(meta_job_id, requested_path)
+            except Exception as error:
+                self.logger.warning("Seed endpoint %s generation failed: %s", requested_path, error)
+                summary["failed"] += 1
+                continue
+
+            if is_generated:
+                summary["generated"] += 1
+            else:
+                summary["failed"] += 1
+
+        return summary
     async def _save_generated_meta(self, requested_path, headers, body_bytes):
         content_hash = hashlib.md5(body_bytes).hexdigest()
         content_file = os.path.join(self.dir, content_hash)

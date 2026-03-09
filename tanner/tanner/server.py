@@ -179,6 +179,39 @@ class TannerServer:
 
         return web.json_response(response_msg)
 
+    async def handle_meta_generate(self, request):
+        data = await request.read()
+        try:
+            data = json.loads(data.decode("utf-8"))
+            path = yarl.URL(data["path"]).human_repr()
+        except (TypeError, ValueError, KeyError) as error:
+            self.logger.exception("error parsing meta generate request: %s", data)
+            response_msg = self._make_response(msg=type(error).__name__)
+            return web.json_response(response_msg, status=400)
+
+        host = data.get("host")
+        if not isinstance(host, str) or not host.strip():
+            host = None
+
+        site_profile = data.get("site_profile")
+        if not isinstance(site_profile, dict):
+            site_profile = {}
+
+        index_page = data.get("index_page")
+        if isinstance(index_page, str) and index_page.strip():
+            site_profile["index_page"] = index_page
+        else:
+            site_profile.setdefault("index_page", "/index.html")
+
+        meta_job_id = str(uuid.uuid4())
+        await self._save_meta_job(meta_job_id, {"state": "pending", "path": path})
+        asyncio.create_task(self._run_meta_job(meta_job_id, host, path, site_profile))
+
+        response_msg = self._make_response(
+            msg={"state": "pending", "meta_job_id": meta_job_id, "path": path}
+        )
+        return web.json_response(response_msg, status=202)
+
     async def handle_dorks(self, request):
         dorks = await self.dorks.choose_dorks(self.redis_client)
         response_msg = dict(version=tanner_version, response=dict(dorks=dorks))
@@ -248,6 +281,7 @@ class TannerServer:
     def setup_routes(self, app):
         app.router.add_route("*", "/", self.default_handler)
         app.router.add_post("/event", self.handle_event)
+        app.router.add_post("/meta_generate", self.handle_meta_generate)
         app.router.add_get("/dorks", self.handle_dorks)
         app.router.add_get("/meta_job/{job_id}", self.handle_meta_job)
         app.router.add_get("/version", self.handle_version)

@@ -1,8 +1,22 @@
+import sys
+import types
 import uuid
 from unittest import mock
 import hashlib
 
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
+
+if "aioredis" not in sys.modules:
+    fake_aioredis = types.ModuleType("aioredis")
+    fake_aioredis.from_url = lambda *args, **kwargs: None
+    fake_aioredis.exceptions = types.SimpleNamespace(ConnectionError=Exception)
+    sys.modules["aioredis"] = fake_aioredis
+
+if "pylibinjection" not in sys.modules:
+    fake_pylibinjection = types.ModuleType("pylibinjection")
+    fake_pylibinjection.sqli = lambda value, flags=0: (False, "")
+    fake_pylibinjection.xss = lambda value, flags=0: False
+    sys.modules["pylibinjection"] = fake_pylibinjection
 
 from tanner import server
 from tanner.config import TannerConfig
@@ -45,6 +59,7 @@ class TestServer(AioHTTPTestCase):
 
         self.serv.session_manager.add_or_update_session = _add_or_update_mock
         self.serv.session_manager.delete_sessions_on_shutdown = _delete_sessions_mock
+        self.serv.session_manager.delete_old_sessions = _delete_sessions_mock
 
         async def choosed(client):
             return [x for x in range(10)]
@@ -103,6 +118,39 @@ class TestServer(AioHTTPTestCase):
         detection = await request.json()
         self.assertDictEqual(detection, detection_assert)
 
+
+    @unittest_run_loop
+    async def test_meta_generate_request(self):
+        self.serv._save_meta_job = AsyncMock()
+        self.serv._run_meta_job = AsyncMock()
+
+        with mock.patch("tanner.server.asyncio.create_task") as create_task:
+            create_task.side_effect = lambda coro: coro.close()
+            request = await self.client.request(
+                "POST",
+                "/meta_generate",
+                data=b'{"path":"/seed/page","host":"seed.example","index_page":"/index.html"}',
+            )
+
+        assert request.status == 202
+        response = await request.json()
+        message = response["response"]["message"]
+        self.assertEqual(message["state"], "pending")
+        self.assertEqual(message["path"], "/seed/page")
+        self.assertIn("meta_job_id", message)
+
+        self.serv._save_meta_job.assert_called_once()
+        save_job_args = self.serv._save_meta_job.call_args[0]
+        self.assertEqual(save_job_args[1]["state"], "pending")
+        self.assertEqual(save_job_args[1]["path"], "/seed/page")
+        create_task.assert_called_once()
+
+    @unittest_run_loop
+    async def test_meta_generate_invalid_payload(self):
+        request = await self.client.request("POST", "/meta_generate", data=b'{}')
+        assert request.status == 400
+        response = await request.json()
+        self.assertEqual(response["response"]["message"], "KeyError")
     @unittest_run_loop
     async def test_dorks_request(self):
         assert_content = dict(version=tanner_version, response=dict(dorks=[x for x in range(10)]))
