@@ -35,7 +35,24 @@ class TestLocalQwenGenerator(unittest.TestCase):
         return self._config[(section, value)]
 
     def test_generate_page_success(self):
-        response_payload = {
+        spec_response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "site_type": "admin",
+                                "tone": "technical",
+                                "title": "Admin Login",
+                                "nav": [{"label": "Login", "href": "/login"}],
+                                "sections": [{"id": "hero-login", "kind": "hero", "heading": "Sign in"}],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        render_response_payload = {
             "choices": [
                 {
                     "message": {
@@ -52,7 +69,8 @@ class TestLocalQwenGenerator(unittest.TestCase):
             ]
         }
 
-        with mock.patch.object(self.generator, "_request_completion", new=mock.AsyncMock(return_value=response_payload)):
+        completion_mock = mock.AsyncMock(side_effect=[spec_response_payload, render_response_payload])
+        with mock.patch.object(self.generator, "_request_completion", new=completion_mock):
             result = self.loop.run_until_complete(
                 self.generator.generate_page(host="example.com", path="/admin/login", site_profile={"index_page": "/index.html"})
             )
@@ -62,17 +80,43 @@ class TestLocalQwenGenerator(unittest.TestCase):
         self.assertIn(b"Admin Login", result["body_bytes"])
         self.assertIn({"X-Source": "local-qwen"}, result["headers"])
         self.assertIn({"Content-Type": "text/html; charset=utf-8"}, result["headers"])
+        self.assertEqual(completion_mock.await_count, 2)
 
-    def test_generate_page_fallback_after_failures(self):
-        with mock.patch.object(
-            self.generator,
-            "_request_completion",
-            new=mock.AsyncMock(side_effect=aiohttp.ClientError("connect failed")),
-        ):
+    def test_generate_page_fallback_after_transport_failures(self):
+        completion_mock = mock.AsyncMock(side_effect=aiohttp.ClientError("connect failed"))
+        with mock.patch.object(self.generator, "_request_completion", new=completion_mock):
             result = self.loop.run_until_complete(
                 self.generator.generate_page(host="example.com", path="/status", site_profile={})
             )
 
         self.assertEqual(result["path"], "/status")
         self.assertEqual(result["headers"], [{"Content-Type": "text/html; charset=utf-8"}])
+        self.assertIn(b"Service Temporarily Unavailable", result["body_bytes"])
+
+    def test_generate_page_fallback_after_invalid_stage_a_spec(self):
+        invalid_spec_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "site_type": "admin",
+                                "tone": "technical",
+                                "title": "x",
+                                "nav": [],
+                                "sections": [],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        completion_mock = mock.AsyncMock(return_value=invalid_spec_payload)
+        with mock.patch.object(self.generator, "_request_completion", new=completion_mock):
+            result = self.loop.run_until_complete(
+                self.generator.generate_page(host="example.com", path="/status", site_profile={})
+            )
+
+        self.assertEqual(result["path"], "/status")
         self.assertIn(b"Service Temporarily Unavailable", result["body_bytes"])

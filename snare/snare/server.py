@@ -21,6 +21,30 @@ class HttpRequestHandler:
         self.sroute = StaticRoute(name=None, prefix="/", directory=self.dir)
         self.tanner_handler = TannerHandler(run_args, meta, snare_uuid)
 
+    def _schedule_background_task(self, coroutine, task_name):
+        try:
+            create_task = getattr(asyncio, "create_task", None)
+            if callable(create_task):
+                task = create_task(coroutine)
+            else:
+                task = asyncio.ensure_future(coroutine)
+        except Exception:
+            self.logger.exception("Failed to schedule background task '%s'", task_name)
+            return
+
+        def _log_failure(completed_task):
+            try:
+                error = completed_task.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                self.logger.exception("Failed inspecting task '%s' result", task_name)
+                return
+            if error:
+                self.logger.error("Background task '%s' failed: %s", task_name, error)
+
+        task.add_done_callback(_log_failure)
+
     async def submit_slurp(self, data):
         try:
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
@@ -111,7 +135,10 @@ class HttpRequestHandler:
         event_message = event_result.get("response", {}).get("message", {}) if event_result else {}
         meta_job_id = event_message.get("meta_job_id")
         if meta_job_id:
-            asyncio.create_task(self.tanner_handler.poll_meta_job(meta_job_id, request.path_qs))
+            self._schedule_background_task(
+                self.tanner_handler.poll_meta_job(meta_job_id, request.path_qs),
+                "poll_meta_job",
+            )
 
         # Log the event to slurp service if enabled
         if self.run_args.slurp_enabled:

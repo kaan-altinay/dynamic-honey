@@ -8,7 +8,7 @@ import json
 import logging
 import aiohttp
 
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from bs4 import BeautifulSoup
 from snare.html_handler import HtmlHandler
 
@@ -109,6 +109,11 @@ class TannerHandler:
             return normalized_path[:-1]
         return normalized_path
 
+    @staticmethod
+    def _is_external_seed_url(seed_value):
+        parsed_seed = urlsplit(seed_value)
+        return bool(parsed_seed.scheme and parsed_seed.netloc)
+
     def parse_seed_endpoints(self, seed_endpoints_path):
         if not seed_endpoints_path:
             return []
@@ -119,6 +124,9 @@ class TannerHandler:
             for endpoint in seed_fh:
                 endpoint = endpoint.strip()
                 if not endpoint or endpoint.startswith("#"):
+                    continue
+
+                if self._is_external_seed_url(endpoint):
                     continue
 
                 normalized_endpoint = self._normalize_meta_path(endpoint)

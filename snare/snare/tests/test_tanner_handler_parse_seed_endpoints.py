@@ -31,6 +31,8 @@ class TestParseSeedEndpoints(unittest.TestCase):
             seed_file.write("/admin\n")
             seed_file.write("admin\n")
             seed_file.write("/admin?source=seed\n")
+            seed_file.write("http://ip-api.com/json/\n")
+            seed_file.write("HTTPS://example.org/health\n")
             seed_file.write("/\n")
             seed_file.write("/index.html\n")
             seed_file.write("#ignored\n")

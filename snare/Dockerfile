@@ -18,4 +18,4 @@ ENV TANNER tanner.mushmush.org
 
 RUN clone --target "http://$PAGE_URL"
 
-CMD snare --no-dorks true --auto-update false --host-ip 0.0.0.0 --port $PORT --page-dir "$PAGE_URL" --tanner $TANNER
+CMD python3 /bin/snare --no-dorks true --auto-update false --host-ip 0.0.0.0 --port $PORT --page-dir "$PAGE_URL" --tanner $TANNER --seed-endpoints seedfile.txt
