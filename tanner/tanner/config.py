@@ -39,4 +39,15 @@ class TannerConfig:
         return res
 
 
-DEFAULT_CONFIG = TannerConfig.read_config("/opt/tanner/data/config.yaml")
+def _load_default_config():
+    candidate_paths = [
+        "/opt/tanner/data/config.yaml",
+        os.path.join(os.path.dirname(__file__), "data", "config.yaml"),
+    ]
+    for candidate_path in candidate_paths:
+        if os.path.exists(candidate_path):
+            return TannerConfig.read_config(candidate_path)
+    raise FileNotFoundError("Unable to locate Tanner config.yaml in {}".format(candidate_paths))
+
+
+DEFAULT_CONFIG = _load_default_config()

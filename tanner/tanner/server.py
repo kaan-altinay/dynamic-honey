@@ -11,7 +11,8 @@ from tanner import dorks_manager, redis_client
 from tanner.sessions import session_manager
 from tanner.config import TannerConfig
 from tanner.emulators import base
-from tanner.generator import base_generator, local_qwen_generator
+from tanner.generator import base_generator
+from tanner.generator.agentic import AgenticBundleGenerator, GeneratedBundle
 from tanner.reporting.log_local import Reporting as local_report
 from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
@@ -44,9 +45,9 @@ class TannerServer:
         except KeyError:
             backend = None
 
-        if isinstance(backend, str) and backend.strip().lower() == "local_qwen":
-            self.logger.info("Using LocalQwenGenerator backend")
-            return local_qwen_generator.LocalQwenGenerator()
+        if isinstance(backend, str) and backend.strip().lower() == "agentic":
+            self.logger.info("Using AgenticBundleGenerator backend")
+            return AgenticBundleGenerator()
         return base_generator.BaseGenerator()
 
     @staticmethod
@@ -75,6 +76,28 @@ class TannerServer:
             return peer.get("ip")
         return None
 
+    @staticmethod
+    def _serialize_generated_artifact(artifact):
+        body_b64 = base64.b64encode(bytes(artifact.body_bytes)).decode("ascii")
+        return {
+            "path": artifact.path,
+            "kind": artifact.kind,
+            "headers": artifact.headers,
+            "body_b64": body_b64,
+            "status_code": artifact.status_code,
+        }
+
+    @staticmethod
+    def _deserialize_json_field(raw_value, default):
+        if raw_value is None or raw_value == "":
+            return default
+        if isinstance(raw_value, (dict, list)):
+            return raw_value
+        try:
+            return json.loads(raw_value)
+        except (TypeError, ValueError):
+            return default
+
     async def _save_meta_job(self, job_id, fields):
         if self.redis_client is None:
             return
@@ -94,25 +117,21 @@ class TannerServer:
 
     async def _run_meta_job(self, job_id, host, path, site_profile):
         try:
-            generation_result = await self.generator.generate_page(host=host, path=path, site_profile=site_profile)
+            generation_result = await self.generator.generate_bundle(host=host, path=path, site_profile=site_profile)
             if not generation_result:
                 raise NotImplementedError("Meta generation is not implemented for the current generator")
 
-            body_bytes = generation_result.get("body_bytes")
-            if not isinstance(body_bytes, (bytes, bytearray)):
-                raise ValueError("Generator must return body_bytes as bytes")
-
-            headers = generation_result.get("headers", [])
-            page_path = generation_result.get("path", path)
-            body_b64 = base64.b64encode(bytes(body_bytes)).decode("ascii")
+            bundle = GeneratedBundle.model_validate(generation_result)
+            artifacts = [self._serialize_generated_artifact(artifact) for artifact in bundle.artifacts]
 
             await self._save_meta_job(
                 job_id,
                 {
                     "state": "ready",
-                    "path": page_path,
-                    "headers": headers,
-                    "body_b64": body_b64,
+                    "primary_path": bundle.primary_path,
+                    "artifacts": artifacts,
+                    "review_summary": bundle.review_summary,
+                    "used_fallback": bundle.used_fallback,
                 },
             )
         except Exception as error:
@@ -247,21 +266,15 @@ class TannerServer:
             )
             return web.json_response(response_msg, status=500)
 
-        headers = []
-        headers_raw = job_data.get("headers")
-        if headers_raw:
-            try:
-                headers = json.loads(headers_raw)
-            except ValueError:
-                self.logger.warning("Invalid headers payload for meta job %s", job_id)
-
+        artifacts = self._deserialize_json_field(job_data.get("artifacts"), [])
         response_msg = self._make_response(
             msg={
                 "state": "ready",
                 "job_id": job_id,
-                "path": job_data.get("path"),
-                "headers": headers,
-                "body_b64": job_data.get("body_b64", ""),
+                "primary_path": job_data.get("primary_path"),
+                "artifacts": artifacts,
+                "review_summary": job_data.get("review_summary", ""),
+                "used_fallback": str(job_data.get("used_fallback", "")).lower() == "true",
             }
         )
         return web.json_response(response_msg)

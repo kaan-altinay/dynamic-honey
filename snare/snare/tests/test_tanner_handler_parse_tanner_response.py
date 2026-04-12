@@ -1,9 +1,11 @@
+import base64
 import unittest
 import asyncio
 import argparse
 import shutil
 import os
 import json
+import tempfile
 import multidict
 from snare.utils.asyncmock import AsyncMock
 from snare.utils.page_path_generator import generate_unique_path
@@ -15,8 +17,7 @@ class TestParseTannerResponse(unittest.TestCase):
         run_args = argparse.ArgumentParser()
         run_args.add_argument("--tanner")
         run_args.add_argument("--page-dir")
-        self.main_page_path = generate_unique_path()
-        os.makedirs(self.main_page_path)
+        self.main_page_path = tempfile.mkdtemp(prefix="snare-parse-response-")
         page_dir = self.main_page_path.rsplit("/")[-1]
         meta_content = {
             "/index.html": {
@@ -41,7 +42,7 @@ class TestParseTannerResponse(unittest.TestCase):
         self.uuid = "test_uuid"
         self.handler = TannerHandler(self.args, meta_content, self.uuid)
         self.requested_name = "/"
-        self.loop = asyncio.get_event_loop()
+        self.loop = asyncio.new_event_loop()
         self.handler.html_handler.handle_content = AsyncMock(return_value=self.page_content)
         self.res1 = None
         self.res2 = None
@@ -226,5 +227,32 @@ class TestParseTannerResponse(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.loop.run_until_complete(test())
 
+    def test_parse_type_one_resolves_adjacent_generated_bundle_resource(self):
+        artifacts = [
+            {
+                "path": "/robots.txt",
+                "headers": [{"Content-Type": "text/plain; charset=utf-8"}],
+                "body_b64": base64.b64encode(b"User-agent: *\nDisallow: /private\n").decode("ascii"),
+                "status_code": 200,
+            }
+        ]
+        self.loop.run_until_complete(self.handler._save_generated_artifacts(artifacts, "/robots.txt"))
+        self.requested_name = "/robots.txt"
+        self.detection = {"type": 1}
+
+        async def test():
+            (
+                self.res1,
+                self.res2,
+                self.res3,
+            ) = await self.handler.parse_tanner_response(self.requested_name, self.detection)
+
+        self.loop.run_until_complete(test())
+        self.assertEqual(self.res1, b"User-agent: *\nDisallow: /private\n")
+        self.assertEqual(self.res2["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(self.res3, 200)
+
+
     def tearDown(self):
+        self.loop.close()
         shutil.rmtree(self.main_page_path)

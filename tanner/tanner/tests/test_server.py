@@ -1,3 +1,4 @@
+import base64
 import sys
 import types
 import uuid
@@ -151,6 +152,75 @@ class TestServer(AioHTTPTestCase):
         assert request.status == 400
         response = await request.json()
         self.assertEqual(response["response"]["message"], "KeyError")
+    @unittest_run_loop
+    async def test_run_meta_job_saves_bundle_payload(self):
+        bundle = {
+            "primary_path": "/seed/page",
+            "artifacts": [
+                {
+                    "path": "/seed/page",
+                    "kind": "html_page",
+                    "headers": [{"Content-Type": "text/html; charset=utf-8"}],
+                    "body_bytes": b"<html><body>seed</body></html>",
+                    "status_code": 200,
+                    "source_artifact_id": "primary-page",
+                    "artifact_scope": "static_file",
+                },
+                {
+                    "path": "/robots.txt",
+                    "kind": "robots_txt",
+                    "headers": [{"Content-Type": "text/plain; charset=utf-8"}],
+                    "body_bytes": b"User-agent: *\nDisallow: /private\n",
+                    "status_code": 200,
+                    "source_artifact_id": "robots",
+                    "artifact_scope": "static_file",
+                },
+            ],
+            "review_summary": "approved",
+            "used_fallback": False,
+        }
+        self.serv.generator.generate_bundle = AsyncMock(return_value=bundle)
+        self.serv._save_meta_job = AsyncMock()
+
+        await self.serv._run_meta_job("job-1", "seed.example", "/seed/page", {"index_page": "/index.html"})
+
+        self.serv._save_meta_job.assert_called_once()
+        saved_fields = self.serv._save_meta_job.call_args[0][1]
+        self.assertEqual(saved_fields["state"], "ready")
+        self.assertEqual(saved_fields["primary_path"], "/seed/page")
+        self.assertEqual(saved_fields["review_summary"], "approved")
+        self.assertEqual(len(saved_fields["artifacts"]), 2)
+        self.assertEqual(saved_fields["artifacts"][0]["path"], "/seed/page")
+        self.assertEqual(
+            base64.b64decode(saved_fields["artifacts"][0]["body_b64"]),
+            b"<html><body>seed</body></html>",
+        )
+
+    @unittest_run_loop
+    async def test_meta_job_ready_returns_bundle_payload(self):
+        self.serv.redis_client.hgetall = AsyncMock(
+            return_value={
+                "state": "ready",
+                "primary_path": "/seed/page",
+                "artifacts": '[{"path": "/seed/page", "kind": "html_page", "headers": [{"Content-Type": "text/html; charset=utf-8"}], "body_b64": "c2VlZA==", "status_code": 200}]',
+                "review_summary": "approved",
+                "used_fallback": "False",
+            }
+        )
+
+        request = await self.client.request("GET", "/meta_job/job-123")
+
+        assert request.status == 200
+        response = await request.json()
+        message = response["response"]["message"]
+        self.assertEqual(message["state"], "ready")
+        self.assertEqual(message["primary_path"], "/seed/page")
+        self.assertEqual(message["review_summary"], "approved")
+        self.assertFalse(message["used_fallback"])
+        self.assertEqual(len(message["artifacts"]), 1)
+        self.assertEqual(message["artifacts"][0]["path"], "/seed/page")
+
+
     @unittest_run_loop
     async def test_dorks_request(self):
         assert_content = dict(version=tanner_version, response=dict(dorks=[x for x in range(10)]))

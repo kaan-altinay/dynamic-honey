@@ -33,13 +33,35 @@ REDIS:
 
 
 GENERATOR:
-  backend: none
-  endpoint: http://127.0.0.1:8000/v1/chat/completions
-  model: qwen-local
-  timeout: 60
-  retries: 2
-  temperature: 0.15
-  max_tokens: 700
+  backend: agentic
+  max_review_loops: 1
+  max_bundle_artifacts: 5
+  max_bundle_bytes: 262144
+  checkpoint_path: /tmp/tanner-agentic-checkpoints.sqlite
+  enable_live_research: False
+  max_tool_response_chars: 4000
+  max_command_output_chars: 4000
+  command_timeout: 5
+  role_defaults:
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.2
+    max_tokens: 900
+    timeout: 120
+    max_retries: 2
+  roles:
+    expert:
+      temperature: 0.1
+      max_tokens: 900
+    design:
+      temperature: 0.2
+      max_tokens: 900
+    coder:
+      temperature: 0.35
+      max_tokens: 1000
+    review:
+      temperature: 0.05
+      max_tokens: 700
 
 EMULATORS:
   root_dir: /opt/tanner

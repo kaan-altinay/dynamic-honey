@@ -2,68 +2,106 @@
 set -euo pipefail
 
 usage() {
-  cat <<'USAGE'
-Usage: ./capture_session.sh [options]
+  cat <<'EOF'
+Usage:
+  ./capture_session.sh start --run-name <name> (--range <start-end> | --range-start <start>) [options]
+  ./capture_session.sh stop --run-name <name> [options]
+  ./capture_session.sh status --run-name <name> [options]
+  ./capture_session.sh list [options]
+  ./capture_session.sh stop-legacy [options]
 
-Starts Tanner + Snare stacks, starts tcpdump, and archives run artifacts on shutdown.
-The artifact directory is captures/<run-start-timestamp>/.
+Commands:
+  start         Start one dynamic-honey instance for a contiguous 4-IP public range.
+  stop          Stop a named instance and archive docker logs into its run directory.
+  status        Show status for a named instance.
+  list          List known run directories and their recorded metadata.
+  stop-legacy   Stop the currently running legacy snare/tanner stack started from the base compose files.
 
 Options:
-  --iface <name>       Capture interface (default: auto-detect tanner_local bridge, fallback: any)
-  --pcap-dir <path>    Directory for run artifacts (default: ./captures)
-  --filter <bpf>       tcpdump BPF filter (default: tcp)
-  --build              Rebuild images before starting services
-  --no-down            Keep stacks running on shutdown (default: bring stacks down)
-  --dry-run            Print commands without executing
-  --strict-firewall    Fail if bridge forwarding rule cannot be verified/inserted
-  -h, --help           Show this help
+  --run-name <name>       Required for start/stop/status. Used as the capture directory name under captures_new/.
+                          Example: default_first_run, cache_first_run.
+  --mode <name>           default | agentic | current | cache (default: agentic)
+                          default  -> same source tree, but with GENERATOR.backend forced to none via temp config.
+                          agentic/current/cache -> use the repo config as-is.
+  --range <start-end>     Public IP host suffix range, must be a contiguous block of 4 aligned on 16,20,24,28.
+                          Example: 16-19
+  --range-start <start>   Equivalent shorthand for a 4-IP block. Example: --range-start 16 means 16-19.
+  --captures-dir <path>   Artifact root (default: ./captures_new)
+  --iface <name>          Capture interface (default: eth0)
+  --page-url <host>       Snare page-dir / PAGE_URL (default: example.com)
+  --build                 Rebuild images before starting services
+  --dry-run               Print commands without executing
+  -h, --help              Show this help
 
-Examples:
-  ./capture_session.sh
-  ./capture_session.sh --filter 'tcp port 80 or tcp port 8090'
-  ./capture_session.sh --build --iface any
-USAGE
+Notes:
+  - Start one instance per 4-IP range. Up to four concurrent runs can cover 16-19, 20-23, 24-27, and 28-31.
+  - This script uses the same source tree for every run. Separate run directories keep captures, runtime files,
+    and snare state isolated.
+  - The "default" mode disables the agentic backend via a temporary Tanner config overlay. It does not restore a
+    pristine upstream source tree; for that you would need a separate clean checkout or image.
+EOF
 }
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TANNER_COMPOSE="${ROOT_DIR}/tanner/docker/docker-compose.yml"
-SNARE_COMPOSE="${ROOT_DIR}/snare/docker-compose.yml"
-PCAP_DIR="${ROOT_DIR}/captures"
-BPF_FILTER="tcp"
+BASE_TANNER_COMPOSE="${ROOT_DIR}/tanner/docker/docker-compose.yml"
+BASE_SNARE_COMPOSE="${ROOT_DIR}/snare/docker-compose.yml"
+BASE_TANNER_CONFIG="${ROOT_DIR}/tanner/tanner/data/config.yaml"
+CAPTURES_DIR="${ROOT_DIR}/captures_new"
+SNARE_TEMPLATE_DIR="/home/kaan/snare-data/snare"
+PUBLIC_IP_PREFIX="145.220.178"
+DEFAULT_PAGE_URL="example.com"
+DEFAULT_IFACE="eth0"
+
+COMMAND="${1:-}"
+if [[ -n "$COMMAND" ]]; then
+  shift
+fi
+
+RUN_NAME=""
+MODE="agentic"
+RANGE=""
+RANGE_START=""
+IFACE="${DEFAULT_IFACE}"
+PAGE_URL="${DEFAULT_PAGE_URL}"
 BUILD=0
 DRY_RUN=0
-FIREWALL_STRICT=0
-STOP_STACKS=1
-IFACE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --run-name)
+      RUN_NAME="${2:-}"
+      shift 2
+      ;;
+    --mode)
+      MODE="${2:-}"
+      shift 2
+      ;;
+    --range)
+      RANGE="${2:-}"
+      shift 2
+      ;;
+    --range-start)
+      RANGE_START="${2:-}"
+      shift 2
+      ;;
+    --captures-dir)
+      CAPTURES_DIR="${2:-}"
+      shift 2
+      ;;
     --iface)
       IFACE="${2:-}"
       shift 2
       ;;
-    --pcap-dir)
-      PCAP_DIR="${2:-}"
-      shift 2
-      ;;
-    --filter)
-      BPF_FILTER="${2:-}"
+    --page-url)
+      PAGE_URL="${2:-}"
       shift 2
       ;;
     --build)
       BUILD=1
       shift
       ;;
-    --no-down)
-      STOP_STACKS=0
-      shift
-      ;;
     --dry-run)
       DRY_RUN=1
-      shift
-      ;;
-    --strict-firewall)
-      FIREWALL_STRICT=1
       shift
       ;;
     -h|--help)
@@ -86,6 +124,37 @@ require_file() {
   fi
 }
 
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Required command not found: $cmd" >&2
+    exit 1
+  fi
+}
+
+require_sudo_if_needed() {
+  if [[ "$EUID" -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+    echo "This action requires root privileges or sudo." >&2
+    exit 1
+  fi
+}
+
+compose_bin() {
+  if command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
+    return
+  fi
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+    return
+  fi
+  echo "Docker Compose is not available" >&2
+  exit 1
+}
+
+COMPOSE_BIN_STR="$(compose_bin)"
+read -r -a COMPOSE_BIN <<<"${COMPOSE_BIN_STR}"
+
 run_cmd() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '[dry-run]'
@@ -98,280 +167,570 @@ run_cmd() {
   fi
 }
 
-detect_iface() {
-  local network_id
-  network_id="$(docker network inspect -f '{{.Id}}' tanner_local 2>/dev/null || true)"
-  if [[ -z "$network_id" ]]; then
-    echo "any"
-    return
-  fi
+run_compose() {
+  local -a args=("${COMPOSE_BIN[@]}" "$@")
+  run_cmd "${args[@]}"
+}
 
-  local bridge_iface="br-${network_id:0:12}"
-  if ip link show "$bridge_iface" >/dev/null 2>&1; then
-    echo "$bridge_iface"
+need_sudo_for_signal() {
+  local pid="$1"
+  local owner
+  owner="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -z "$owner" || "$owner" == "$USER" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+kill_pid_if_running() {
+  local pid="$1"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+  if need_sudo_for_signal "$pid"; then
+    require_sudo_if_needed
+    run_cmd sudo kill "$pid"
   else
-    echo "any"
+    run_cmd kill "$pid"
   fi
 }
 
-ensure_bridge_forward_rule() {
-  local network_id
-  network_id="$(docker network inspect -f '{{.Id}}' tanner_local 2>/dev/null || true)"
-  if [[ -z "$network_id" ]]; then
-    if [[ "$FIREWALL_STRICT" -eq 1 ]]; then
-      echo "[error] Docker network 'tanner_local' not found; cannot ensure forwarding rule" >&2
+slugify() {
+  local value="$1"
+  value="$(echo "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  printf '%s' "$value"
+}
+
+normalize_mode() {
+  case "$1" in
+    default) echo "default" ;;
+    agentic|current|cache) echo "agentic" ;;
+    *)
+      echo "Unsupported mode: $1" >&2
       exit 1
-    fi
-    echo "[warn] Docker network 'tanner_local' not found; skipping forwarding rule check"
-    return
-  fi
+      ;;
+  esac
+}
 
-  local bridge_iface="br-${network_id:0:12}"
-  local sudo_prefix=()
-
-  if [[ "$EUID" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-      sudo_prefix=(sudo)
-    else
-      if [[ "$FIREWALL_STRICT" -eq 1 ]]; then
-        echo "[error] Root privileges are required to manage iptables and sudo is unavailable" >&2
-        exit 1
-      fi
-      echo "[warn] Cannot ensure forwarding rule without root or sudo; continuing"
-      return
-    fi
-  fi
-
-  if ! command -v iptables >/dev/null 2>&1; then
-    if [[ "$FIREWALL_STRICT" -eq 1 ]]; then
-      echo "[error] iptables command not found; cannot ensure forwarding rule" >&2
-      exit 1
-    fi
-    echo "[warn] iptables command not found; skipping forwarding rule check"
-    return
-  fi
-
-  if "${sudo_prefix[@]}" iptables -C DOCKER-USER -i "$bridge_iface" -o "$bridge_iface" -j ACCEPT >/dev/null 2>&1; then
-    echo "[info] Docker bridge forwarding rule already present for '$bridge_iface'"
-    return
-  fi
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[dry-run]'
-    for arg in "${sudo_prefix[@]}" iptables -I DOCKER-USER 1 -i "$bridge_iface" -o "$bridge_iface" -j ACCEPT; do
-      printf ' %q' "$arg"
-    done
-    printf '\n'
-    echo "[info] Docker bridge forwarding rule would be added for '$bridge_iface'"
-    return
-  fi
-
-  if "${sudo_prefix[@]}" iptables -I DOCKER-USER 1 -i "$bridge_iface" -o "$bridge_iface" -j ACCEPT; then
-    echo "[ok] Added Docker bridge forwarding rule for '$bridge_iface'"
-    return
-  fi
-
-  if [[ "$FIREWALL_STRICT" -eq 1 ]]; then
-    echo "[error] Failed to add forwarding rule for '$bridge_iface'" >&2
+parse_range() {
+  local start end
+  if [[ -n "$RANGE" && -n "$RANGE_START" ]]; then
+    echo "Specify either --range or --range-start, not both." >&2
     exit 1
   fi
-  echo "[warn] Failed to add forwarding rule for '$bridge_iface'; continuing"
+  if [[ -n "$RANGE" ]]; then
+    if [[ ! "$RANGE" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      echo "Invalid --range format. Expected start-end, for example 16-19." >&2
+      exit 1
+    fi
+    start="${BASH_REMATCH[1]}"
+    end="${BASH_REMATCH[2]}"
+  elif [[ -n "$RANGE_START" ]]; then
+    start="$RANGE_START"
+    end="$((RANGE_START + 3))"
+  else
+    echo "A 4-IP public range is required. Use --range 16-19 or --range-start 16." >&2
+    exit 1
+  fi
+
+  if (( start < 16 || end > 31 || end - start != 3 )); then
+    echo "Range must stay within 16-31 and contain exactly 4 IPs." >&2
+    exit 1
+  fi
+  if (( (start - 16) % 4 != 0 )); then
+    echo "Range must start on one of 16, 20, 24, or 28." >&2
+    exit 1
+  fi
+
+  RANGE_START="$start"
+  RANGE_END="$end"
+  GROUP_INDEX="$(((start - 16) / 4))"
 }
 
-export_first_existing_file() {
-  local container="$1"
-  local output_path="$2"
-  shift 2
-  local candidates=("$@")
+build_ip_list() {
+  IP_LIST=()
+  local suffix
+  for ((suffix = RANGE_START; suffix <= RANGE_END; suffix++)); do
+    IP_LIST+=("${PUBLIC_IP_PREFIX}.${suffix}")
+  done
+}
 
+build_tcpdump_filter() {
+  local host_parts=()
+  local ip
+  for ip in "${IP_LIST[@]}"; do
+    host_parts+=("host ${ip}")
+  done
+  local joined
+  joined="$(printf ' or %s' "${host_parts[@]}")"
+  joined="${joined:4}"
+  TCPDUMP_FILTER="tcp and (${joined})"
+}
+
+init_run_layout() {
+  RUN_DIR="${CAPTURES_DIR}/${RUN_NAME}"
+  RUNTIME_DIR="${RUN_DIR}/runtime"
+  STATE_DIR="${RUN_DIR}/snare_state"
+
+  RUN_INFO_PATH="${RUN_DIR}/run_info.env"
+  PCAP_PATH="${RUN_DIR}/capture.pcap"
+  TCPDUMP_LOG_PATH="${RUN_DIR}/tcpdump.log"
+  TANNER_COMPOSE_PATH="${RUNTIME_DIR}/tanner.compose.yml"
+  SNARE_COMPOSE_PATH="${RUNTIME_DIR}/snare.compose.yml"
+  TANNER_CONFIG_PATH="${RUNTIME_DIR}/tanner.config.yaml"
+
+  INSTANCE_SLUG="$(slugify "$RUN_NAME")"
+  PROJECT_NAME="dh-${INSTANCE_SLUG}"
+  NETWORK_NAME="${PROJECT_NAME}-net"
+  WEB_PORT="$((8091 + GROUP_INDEX))"
+
+  SNARE_CONTAINER="${PROJECT_NAME}-snare"
+  TANNER_CONTAINER="${PROJECT_NAME}-tanner"
+  TANNER_API_CONTAINER="${PROJECT_NAME}-tanner-api"
+  TANNER_WEB_CONTAINER="${PROJECT_NAME}-tanner-web"
+  TANNER_REDIS_CONTAINER="${PROJECT_NAME}-tanner-redis"
+  TANNER_PHPOX_CONTAINER="${PROJECT_NAME}-tanner-phpox"
+}
+
+prepare_run_dirs() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] docker exec ${container} cat <first-existing-candidate> > ${output_path}"
     return 0
   fi
+  mkdir -p "$RUN_DIR" "$RUNTIME_DIR" "$STATE_DIR"
+}
 
-  if ! docker ps --format '{{.Names}}' | grep -Fxq "$container"; then
-    echo "[warn] Container '$container' is not running; skipping ${output_path}"
+seed_snare_state() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] prepare snare state in ${STATE_DIR}"
     return 0
   fi
-
-  local source_path
-  local temp_path
-  temp_path="${output_path}.tmp"
-
-  for source_path in "${candidates[@]}"; do
-    if docker exec "$container" sh -lc "test -f '$source_path'" >/dev/null 2>&1; then
-      if docker exec "$container" sh -lc "cat '$source_path'" > "$temp_path"; then
-        mv "$temp_path" "$output_path"
-        echo "[ok] Saved ${container}:${source_path} -> ${output_path}"
-        return 0
-      fi
-      rm -f "$temp_path"
-      echo "[warn] Found ${container}:${source_path} but failed to export it"
-      return 0
+  mkdir -p "$STATE_DIR"
+  if [[ -d "$SNARE_TEMPLATE_DIR" ]]; then
+    if [[ ! -e "$STATE_DIR/pages" ]]; then
+      mkdir -p "$STATE_DIR/pages"
     fi
+    if [[ ! -d "$STATE_DIR/pages/${PAGE_URL}" && -d "$SNARE_TEMPLATE_DIR/pages/${PAGE_URL}" ]]; then
+      run_cmd rsync -a "$SNARE_TEMPLATE_DIR/pages/${PAGE_URL}" "$STATE_DIR/pages/"
+    fi
+    if [[ ! -f "$STATE_DIR/seedfile.txt" && -f "$SNARE_TEMPLATE_DIR/seedfile.txt" ]]; then
+      run_cmd cp "$SNARE_TEMPLATE_DIR/seedfile.txt" "$STATE_DIR/seedfile.txt"
+    fi
+  fi
+}
+
+write_tanner_config() {
+  local normalized_mode="$1"
+  local temp_mode="$normalized_mode"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] write Tanner config overlay -> ${TANNER_CONFIG_PATH} (mode=${temp_mode})"
+    return 0
+  fi
+  python3 - "$BASE_TANNER_CONFIG" "$TANNER_CONFIG_PATH" "$temp_mode" <<'PY'
+from pathlib import Path
+import re
+import sys
+src, dst, mode = sys.argv[1:4]
+text = Path(src).read_text()
+if mode == "default":
+    text = re.sub(r'(^\s*backend:\s*).*$','\\1none', text, flags=re.M)
+Path(dst).write_text(text)
+PY
+}
+
+write_tanner_compose() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] write Tanner compose -> ${TANNER_COMPOSE_PATH}"
+    return 0
+  fi
+  cat > "$TANNER_COMPOSE_PATH" <<EOF
+version: '2.3'
+services:
+  tanner_redis:
+    build: '${ROOT_DIR}/tanner/docker/redis'
+    image: tanner-redis-local
+    container_name: ${TANNER_REDIS_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    read_only: true
+    tmpfs:
+      - /data
+
+  tanner_phpox:
+    build: '${ROOT_DIR}/tanner/docker/phpox'
+    image: tanner-phpox-local
+    container_name: ${TANNER_PHPOX_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    read_only: true
+    tmpfs: /tmp
+
+  tanner_api:
+    build:
+      context: '${ROOT_DIR}/tanner'
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
+    container_name: ${TANNER_API_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    read_only: true
+    tmpfs:
+      - /tmp/tanner:uid=65534,gid=65534
+      - /var/log/tanner:uid=65534,gid=65534
+    command: ["/opt/tanner/tanner-env/bin/tannerapi", "--config", "/opt/tanner/runtime-config/config.yaml"]
+    volumes:
+      - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
+    depends_on:
+      - tanner_redis
+
+  tanner_web:
+    build:
+      context: '${ROOT_DIR}/tanner'
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
+    container_name: ${TANNER_WEB_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    read_only: true
+    tmpfs:
+      - /tmp/tanner:uid=65534,gid=65534
+      - /var/log/tanner:uid=65534,gid=65534
+    ports:
+      - '127.0.0.1:${WEB_PORT}:8091'
+    command: ["/opt/tanner/tanner-env/bin/tannerweb", "--config", "/opt/tanner/runtime-config/config.yaml"]
+    volumes:
+      - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
+    depends_on:
+      - tanner_api
+      - tanner_redis
+
+  tanner:
+    build:
+      context: '${ROOT_DIR}/tanner'
+      dockerfile: docker/tanner/Dockerfile.local
+    image: tanner-local:patched
+    container_name: ${TANNER_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    read_only: true
+    tmpfs:
+      - /tmp/tanner:uid=65534,gid=65534
+      - /var/log/tanner:uid=65534,gid=65534
+      - /opt/tanner/files:uid=65534,gid=65534
+    command: ["/opt/tanner/tanner-env/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
+    volumes:
+      - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
+    depends_on:
+      - tanner_api
+      - tanner_web
+      - tanner_phpox
+
+networks:
+  local:
+    name: ${NETWORK_NAME}
+EOF
+}
+
+write_snare_compose() {
+  local ports_block=""
+  local ip
+  for ip in "${IP_LIST[@]}"; do
+    ports_block+="      - '${ip}:80:80'"$'\n'
   done
 
-  rm -f "$temp_path"
-  echo "[warn] No matching file found in '$container' for ${output_path}"
-}
-
-copy_container_stdout() {
-  local container="$1"
-  local output_path="$2"
-
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] docker logs --timestamps ${container} > ${output_path}"
+    echo "[dry-run] write Snare compose -> ${SNARE_COMPOSE_PATH}"
     return 0
   fi
 
-  if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$container"; then
-    echo "[warn] Container '${container}' does not exist; skipping docker logs"
+  cat > "$SNARE_COMPOSE_PATH" <<EOF
+version: '2.3'
+services:
+  snare:
+    build: '${ROOT_DIR}/snare'
+    image: snare-snare-local
+    container_name: ${SNARE_CONTAINER}
+    restart: always
+    stop_signal: SIGKILL
+    tty: true
+    networks:
+      - local
+    ports:
+${ports_block%$'\n'}
+    environment:
+      - TANNER=tanner
+      - PAGE_URL=${PAGE_URL}
+      - PORT=80
+    volumes:
+      - '${STATE_DIR}:/opt/snare'
+
+networks:
+  local:
+    external: true
+    name: ${NETWORK_NAME}
+EOF
+}
+
+write_run_info() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] write run metadata -> ${RUN_INFO_PATH}"
     return 0
   fi
-
-  if docker logs --timestamps "$container" >"$output_path" 2>&1; then
-    echo "[ok] Saved docker logs for '$container'"
-  else
-    echo "[warn] Failed to save docker logs for '$container'"
-  fi
-}
-
-record_run_metadata_start() {
-  local metadata_path="$1"
-  cat > "$metadata_path" <<META
-run_start_utc=${RUN_START_UTC}
-run_start_epoch=${RUN_START_EPOCH}
-interface=${IFACE}
-bpf_filter=${BPF_FILTER}
-root_dir=${ROOT_DIR}
-git_commit=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
-snare_compose=${SNARE_COMPOSE}
-tanner_compose=${TANNER_COMPOSE}
-META
-}
-
-append_run_metadata_end() {
-  local metadata_path="$1"
   {
-    echo "run_end_utc=${RUN_END_UTC}"
-    echo "run_end_epoch=${RUN_END_EPOCH}"
-    echo "run_duration_seconds=$((RUN_END_EPOCH - RUN_START_EPOCH))"
-    echo "tcpdump_pid=${TCPDUMP_PID:-unknown}"
-    echo "pcap_path=${PCAP_PATH}"
-  } >> "$metadata_path"
+    printf 'run_name=%q\n' "$RUN_NAME"
+    printf 'mode=%q\n' "$MODE"
+    printf 'project_name=%q\n' "$PROJECT_NAME"
+    printf 'network_name=%q\n' "$NETWORK_NAME"
+    printf 'range_start=%q\n' "$RANGE_START"
+    printf 'range_end=%q\n' "$RANGE_END"
+    printf 'ip_list=%q\n' "${IP_LIST[*]}"
+    printf 'iface=%q\n' "$IFACE"
+    printf 'page_url=%q\n' "$PAGE_URL"
+    printf 'web_port=%q\n' "$WEB_PORT"
+    printf 'tanner_compose=%q\n' "$TANNER_COMPOSE_PATH"
+    printf 'snare_compose=%q\n' "$SNARE_COMPOSE_PATH"
+    printf 'tanner_config=%q\n' "$TANNER_CONFIG_PATH"
+    printf 'state_dir=%q\n' "$STATE_DIR"
+    printf 'pcap_path=%q\n' "$PCAP_PATH"
+    printf 'tcpdump_log_path=%q\n' "$TCPDUMP_LOG_PATH"
+    printf 'snare_container=%q\n' "$SNARE_CONTAINER"
+    printf 'tanner_container=%q\n' "$TANNER_CONTAINER"
+    printf 'tanner_api_container=%q\n' "$TANNER_API_CONTAINER"
+    printf 'tanner_web_container=%q\n' "$TANNER_WEB_CONTAINER"
+    printf 'tanner_redis_container=%q\n' "$TANNER_REDIS_CONTAINER"
+    printf 'tanner_phpox_container=%q\n' "$TANNER_PHPOX_CONTAINER"
+  } > "$RUN_INFO_PATH"
 }
 
-cleanup() {
-  local trap_exit_code=$?
-  if [[ "${CLEANED_UP:-0}" -eq 1 ]]; then
-    return "$trap_exit_code"
+start_tcpdump() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] tcpdump -i ${IFACE} -nn -s 0 -U -w ${PCAP_PATH} ${TCPDUMP_FILTER}"
+    return 0
   fi
-  CLEANED_UP=1
+  require_cmd tcpdump
 
-  set +e
-  RUN_END_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-  RUN_END_EPOCH="$(date +%s)"
-
-  echo "[info] Shutdown requested; archiving run artifacts to ${RUN_DIR}"
-
-  if [[ -n "${TCPDUMP_PID:-}" ]]; then
-    if kill -0 "$TCPDUMP_PID" >/dev/null 2>&1; then
-      kill "$TCPDUMP_PID" >/dev/null 2>&1
-      wait "$TCPDUMP_PID" >/dev/null 2>&1
-      echo "[ok] tcpdump stopped (pid=${TCPDUMP_PID})"
-    else
-      echo "[warn] tcpdump process already exited (pid=${TCPDUMP_PID})"
-    fi
+  local -a prefix=()
+  if [[ "$EUID" -ne 0 ]]; then
+    require_sudo_if_needed
+    prefix=(sudo)
   fi
 
-  export_first_existing_file "snare" "${RUN_DIR}/snare.log" "/opt/snare/snare.log" "/tmp/snare.log"
-  export_first_existing_file "snare" "${RUN_DIR}/snare.err" "/opt/snare/snare.err" "/tmp/snare.err"
-  export_first_existing_file "tanner" "${RUN_DIR}/tanner.log" "/tmp/tanner/tanner.log" "/opt/tanner/tanner.log" "/var/log/tanner/tanner.log"
-  export_first_existing_file "tanner" "${RUN_DIR}/tanner.err" "/tmp/tanner/tanner.err" "/opt/tanner/tanner.err" "/var/log/tanner/tanner.err"
-
-  copy_container_stdout "snare" "${RUN_DIR}/snare.docker.log"
-  copy_container_stdout "tanner" "${RUN_DIR}/tanner.docker.log"
-  copy_container_stdout "tanner_api" "${RUN_DIR}/tanner_api.docker.log"
-  copy_container_stdout "tanner_web" "${RUN_DIR}/tanner_web.docker.log"
-  copy_container_stdout "tanner_redis" "${RUN_DIR}/tanner_redis.docker.log"
-  copy_container_stdout "tanner_phpox" "${RUN_DIR}/tanner_phpox.docker.log"
-
-  append_run_metadata_end "${RUN_INFO_PATH}"
-
-  if [[ "$STOP_STACKS" -eq 1 ]]; then
-    echo "[info] Stopping stacks"
-    docker-compose -f "$SNARE_COMPOSE" down || echo "[warn] Failed to stop snare stack"
-    docker-compose -f "$TANNER_COMPOSE" down || echo "[warn] Failed to stop tanner stack"
-  else
-    echo "[info] Leaving stacks running (--no-down)"
-  fi
-
-  echo "[ok] Run artifacts archived in ${RUN_DIR}"
-  return "$trap_exit_code"
+  nohup "${prefix[@]}" tcpdump -i "$IFACE" -nn -s 0 -U -w "$PCAP_PATH" "$TCPDUMP_FILTER" >"$TCPDUMP_LOG_PATH" 2>&1 &
+  TCPDUMP_PID=$!
+  echo "tcpdump_pid=${TCPDUMP_PID}" >> "$RUN_INFO_PATH"
 }
 
-require_file "$TANNER_COMPOSE"
-require_file "$SNARE_COMPOSE"
-
-RUN_START_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-RUN_START_EPOCH="$(date +%s)"
-RUN_START_TS="$(date +'%Y%m%d_%H%M%S')"
-RUN_DIR="${PCAP_DIR}/${RUN_START_TS}"
-PCAP_PATH="${RUN_DIR}/capture.pcap"
-TCPDUMP_LOG_PATH="${RUN_DIR}/tcpdump.log"
-RUN_INFO_PATH="${RUN_DIR}/run_info.txt"
-CLEANED_UP=0
-
-mkdir -p "$RUN_DIR"
-
-if [[ -z "$IFACE" ]]; then
-  IFACE="$(detect_iface)"
-fi
-
-record_run_metadata_start "$RUN_INFO_PATH"
-
-UP_TANNER_CMD=(docker-compose -f "$TANNER_COMPOSE" up -d)
-UP_SNARE_CMD=(docker-compose -f "$SNARE_COMPOSE" up -d)
-if [[ "$BUILD" -eq 1 ]]; then
-  UP_TANNER_CMD+=(--build)
-  UP_SNARE_CMD+=(--build)
-fi
-
-echo "[info] Restarting stacks"
-run_cmd docker-compose -f "$SNARE_COMPOSE" down
-run_cmd docker-compose -f "$TANNER_COMPOSE" down
-ensure_bridge_forward_rule
-run_cmd "${UP_TANNER_CMD[@]}"
-run_cmd "${UP_SNARE_CMD[@]}"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[dry-run] tcpdump -i $IFACE -nn -s 0 -U -w $PCAP_PATH $BPF_FILTER"
-  echo "[dry-run] run directory: $RUN_DIR"
-  exit 0
-fi
-
-if ! command -v tcpdump >/dev/null 2>&1; then
-  echo "tcpdump not found in PATH" >&2
-  exit 1
-fi
-
-TCPDUMP_PREFIX=()
-if [[ "$EUID" -ne 0 ]]; then
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "tcpdump capture requires root privileges. Run as root or install sudo." >&2
+load_run_info() {
+  RUN_DIR="${CAPTURES_DIR}/${RUN_NAME}"
+  RUN_INFO_PATH="${RUN_DIR}/run_info.env"
+  if [[ ! -f "$RUN_INFO_PATH" ]]; then
+    echo "Run metadata not found: $RUN_INFO_PATH" >&2
     exit 1
   fi
-  TCPDUMP_PREFIX=(sudo)
-fi
 
-trap cleanup EXIT INT TERM
+  local line key raw_value value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    key="${line%%=*}"
+    raw_value="${line#*=}"
+    printf -v value '%b' "${raw_value//\\ / }"
+    case "$key" in
+      run_name|mode|project_name|network_name|range_start|range_end|ip_list|iface|page_url|web_port|tanner_compose|snare_compose|tanner_config|state_dir|pcap_path|tcpdump_log_path|snare_container|tanner_container|tanner_api_container|tanner_web_container|tanner_redis_container|tanner_phpox_container|tcpdump_pid)
+        printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done < "$RUN_INFO_PATH"
+}
 
-echo "[info] Starting tcpdump on interface '$IFACE'"
-"${TCPDUMP_PREFIX[@]}" tcpdump -i "$IFACE" -nn -s 0 -U -w "$PCAP_PATH" "$BPF_FILTER" >"$TCPDUMP_LOG_PATH" 2>&1 &
-TCPDUMP_PID=$!
+write_container_logs() {
+  local name="$1"
+  local output_path="$2"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] docker logs --timestamps ${name} > ${output_path}"
+    return 0
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
+    docker logs --timestamps "$name" >"$output_path" 2>&1 || true
+  fi
+}
 
-echo "[ok] tcpdump started (pid=${TCPDUMP_PID})"
-echo "[ok] Run directory: ${RUN_DIR}"
-echo "[info] Press Ctrl+C to stop capture and archive logs"
+start_run() {
+  MODE="$(normalize_mode "$MODE")"
+  if [[ -z "$RUN_NAME" ]]; then
+    echo "--run-name is required for start." >&2
+    exit 1
+  fi
+  require_file "$BASE_TANNER_COMPOSE"
+  require_file "$BASE_SNARE_COMPOSE"
+  require_file "$BASE_TANNER_CONFIG"
+  require_cmd docker
+  require_cmd python3
+  require_cmd rsync
 
-wait "$TCPDUMP_PID"
+  parse_range
+  build_ip_list
+  build_tcpdump_filter
+  init_run_layout
+
+  if [[ -e "$RUN_DIR" ]]; then
+    echo "Run directory already exists: $RUN_DIR" >&2
+    echo "Use a new --run-name or stop/remove the existing run first." >&2
+    exit 1
+  fi
+
+  prepare_run_dirs
+  seed_snare_state
+  write_tanner_config "$MODE"
+  write_tanner_compose
+  write_snare_compose
+  write_run_info
+
+  echo "[info] Starting run '${RUN_NAME}' (${MODE}) for ${PUBLIC_IP_PREFIX}.${RANGE_START}-${RANGE_END}"
+  echo "[info] Capture dir: ${RUN_DIR}"
+  echo "[info] Snare state: ${STATE_DIR}"
+  echo "[info] Tanner web: http://127.0.0.1:${WEB_PORT}"
+  echo "[info] tcpdump filter: ${TCPDUMP_FILTER}"
+
+  run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans
+  run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" down --remove-orphans
+
+  if [[ "$BUILD" -eq 1 ]]; then
+    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d --build
+    run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d --build
+  else
+    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d
+    run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d
+  fi
+
+  start_tcpdump
+
+  echo "[ok] Run started"
+  echo "[ok] Mode: ${MODE}"
+  echo "[ok] IPs: ${IP_LIST[*]}"
+  echo "[ok] PCAP: ${PCAP_PATH}"
+  if [[ -n "${TCPDUMP_PID:-}" ]]; then
+    echo "[ok] tcpdump pid: ${TCPDUMP_PID}"
+  fi
+}
+
+stop_run() {
+  if [[ -z "$RUN_NAME" ]]; then
+    echo "--run-name is required for stop." >&2
+    exit 1
+  fi
+  load_run_info
+
+  echo "[info] Stopping run '${run_name}'"
+  kill_pid_if_running "${tcpdump_pid:-}"
+
+  write_container_logs "$snare_container" "${RUN_DIR}/snare.docker.log"
+  write_container_logs "$tanner_container" "${RUN_DIR}/tanner.docker.log"
+  write_container_logs "$tanner_api_container" "${RUN_DIR}/tanner_api.docker.log"
+  write_container_logs "$tanner_web_container" "${RUN_DIR}/tanner_web.docker.log"
+  write_container_logs "$tanner_redis_container" "${RUN_DIR}/tanner_redis.docker.log"
+  write_container_logs "$tanner_phpox_container" "${RUN_DIR}/tanner_phpox.docker.log"
+
+  run_compose -p "$project_name" -f "$snare_compose" down --remove-orphans
+  run_compose -p "$project_name" -f "$tanner_compose" down --remove-orphans
+
+  echo "[ok] Run stopped: ${run_name}"
+}
+
+status_run() {
+  if [[ -z "$RUN_NAME" ]]; then
+    echo "--run-name is required for status." >&2
+    exit 1
+  fi
+  load_run_info
+
+  echo "run_name=${run_name}"
+  echo "mode=${mode}"
+  echo "ips=${ip_list}"
+  echo "iface=${iface}"
+  echo "pcap_path=${pcap_path}"
+  echo "web_port=${web_port}"
+
+  if [[ -n "${tcpdump_pid:-}" ]] && kill -0 "${tcpdump_pid}" >/dev/null 2>&1; then
+    echo "tcpdump=running pid=${tcpdump_pid}"
+  else
+    echo "tcpdump=stopped"
+  fi
+
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E "(${snare_container}|${tanner_container}|${tanner_api_container}|${tanner_web_container}|${tanner_redis_container}|${tanner_phpox_container})" || true
+}
+
+list_runs() {
+  if [[ ! -d "$CAPTURES_DIR" ]]; then
+    echo "No capture directory found: ${CAPTURES_DIR}"
+    return 0
+  fi
+  local run_info
+  find "$CAPTURES_DIR" -maxdepth 2 -name run_info.env | sort | while read -r run_info; do
+    echo "--- ${run_info%/run_info.env} ---"
+    sed -n '1,8p' "$run_info"
+  done
+}
+
+stop_legacy() {
+  require_file "$BASE_TANNER_COMPOSE"
+  require_file "$BASE_SNARE_COMPOSE"
+
+  echo "[info] Stopping legacy base stack"
+  run_compose -f "$BASE_SNARE_COMPOSE" down --remove-orphans
+  run_compose -f "$BASE_TANNER_COMPOSE" down --remove-orphans
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] pkill -f 'tcpdump .*${ROOT_DIR}/captures/'"
+    return 0
+  fi
+
+  if pgrep -af "tcpdump .*${ROOT_DIR}/captures/" >/dev/null 2>&1; then
+    require_sudo_if_needed
+    sudo pkill -f "tcpdump .*${ROOT_DIR}/captures/" || true
+  fi
+
+  echo "[ok] Legacy stack stop requested"
+}
+
+case "$COMMAND" in
+  start)
+    start_run
+    ;;
+  stop)
+    stop_run
+    ;;
+  status)
+    status_run
+    ;;
+  list)
+    list_runs
+    ;;
+  stop-legacy)
+    stop_legacy
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: ${COMMAND}" >&2
+    usage
+    exit 1
+    ;;
+esac

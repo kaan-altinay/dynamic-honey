@@ -32,13 +32,13 @@ class TestServerGeneratorSelection(unittest.TestCase):
         return values.get((section, value))
 
     @staticmethod
-    def _config_get_local_qwen(section, value):
+    def _config_get_agentic(section, value):
         values = {
             ("EMULATORS", "root_dir"): "/opt/tanner",
             ("SQLI", "db_name"): "tanner_db",
             ("SESSIONS", "delete_timeout"): 300,
             ("HPFEEDS", "enabled"): False,
-            ("GENERATOR", "backend"): "local_qwen",
+            ("GENERATOR", "backend"): "agentic",
         }
         return values.get((section, value))
 
@@ -51,12 +51,12 @@ class TestServerGeneratorSelection(unittest.TestCase):
 
         self.assertIsInstance(serv.generator, base_generator.BaseGenerator)
 
-    def test_local_qwen_backend_uses_local_generator(self):
-        with mock.patch("tanner.server.TannerConfig.get", side_effect=self._config_get_local_qwen):
+    def test_agentic_backend_uses_agentic_generator(self):
+        with mock.patch("tanner.server.TannerConfig.get", side_effect=self._config_get_agentic):
             with mock.patch("tanner.dorks_manager.DorksManager", mock.Mock()):
                 with mock.patch("tanner.emulators.base.BaseHandler", mock.Mock(), create=True):
                     with mock.patch("tanner.sessions.session_manager.SessionManager", mock.Mock(), create=True):
-                        with mock.patch("tanner.server.local_qwen_generator.LocalQwenGenerator") as generator_cls:
+                        with mock.patch("tanner.server.AgenticBundleGenerator") as generator_cls:
                             generator_instance = mock.Mock()
                             generator_cls.return_value = generator_instance
                             serv = server.TannerServer()

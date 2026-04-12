@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import hashlib
 import re
 import os
@@ -216,22 +217,68 @@ class TannerHandler:
                 summary["failed"] += 1
 
         return summary
-    async def _save_generated_meta(self, requested_path, headers, body_bytes):
-        content_hash = hashlib.md5(body_bytes).hexdigest()
-        content_file = os.path.join(self.dir, content_hash)
-        with open(content_file, "wb") as generated_content:
-            generated_content.write(body_bytes)
+    @staticmethod
+    def _decode_generated_body(body_b64):
+        if not isinstance(body_b64, str) or not body_b64:
+            raise ValueError("Generated artifact is missing body_b64")
+        try:
+            return base64.b64decode(body_b64, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("Generated artifact body decode failed: {}".format(error))
 
-        meta_key = self._normalize_meta_path(requested_path)
-        normalized_headers = self._normalize_headers(headers)
+    def _prepare_generated_artifact(self, artifact, default_requested_path):
+        if not isinstance(artifact, dict):
+            raise ValueError("Generated artifact payload must be an object")
+
+        status_code = artifact.get("status_code", 200)
+        if status_code != 200:
+            raise ValueError("Generated artifact status code must be 200")
+
+        normalized_path = self._normalize_meta_path(artifact.get("path", default_requested_path))
+        body_bytes = self._decode_generated_body(artifact.get("body_b64"))
+        normalized_headers = self._normalize_headers(artifact.get("headers", []))
+        content_hash = hashlib.md5(body_bytes).hexdigest()
+
+        return {
+            "path": normalized_path,
+            "headers": normalized_headers,
+            "body_bytes": body_bytes,
+            "hash": content_hash,
+        }
+
+    async def _save_generated_artifacts(self, artifacts, requested_path):
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("Meta job ready payload did not include artifacts")
+
+        prepared_artifacts = []
+        seen_paths = set()
+        for artifact in artifacts:
+            prepared_artifact = self._prepare_generated_artifact(artifact, requested_path)
+            if prepared_artifact["path"] in seen_paths:
+                raise ValueError("Meta job bundle contains duplicate path {}".format(prepared_artifact["path"]))
+            seen_paths.add(prepared_artifact["path"])
+            prepared_artifacts.append(prepared_artifact)
+
+        for prepared_artifact in prepared_artifacts:
+            content_file = os.path.join(self.dir, prepared_artifact["hash"])
+            with open(content_file, "wb") as generated_content:
+                generated_content.write(prepared_artifact["body_bytes"])
 
         async with self._meta_lock:
-            self.meta[meta_key] = {"hash": content_hash, "headers": normalized_headers}
+            updated_meta = dict(self.meta)
+            for prepared_artifact in prepared_artifacts:
+                updated_meta[prepared_artifact["path"]] = {
+                    "hash": prepared_artifact["hash"],
+                    "headers": prepared_artifact["headers"],
+                }
+
             meta_path = os.path.join(self.dir, "meta.json")
             temp_meta_path = "{}.tmp".format(meta_path)
             with open(temp_meta_path, "w") as meta_file:
-                json.dump(self.meta, meta_file)
+                json.dump(updated_meta, meta_file)
             os.replace(temp_meta_path, meta_path)
+            self.meta.clear()
+            self.meta.update(updated_meta)
 
     async def poll_meta_job(self, meta_job_id, requested_path, poll_interval=1.0, max_attempts=30):
         endpoint = "http://{0}:8090/meta_job/{1}".format(self.run_args.tanner, meta_job_id)
@@ -261,23 +308,21 @@ class TannerHandler:
                     continue
 
                 if state == "ready":
-                    body_b64 = message.get("body_b64")
-                    if not body_b64:
-                        self.logger.warning("Meta job %s returned ready state without body", meta_job_id)
-                        return False
-
+                    artifacts = message.get("artifacts")
                     try:
-                        body_bytes = base64.b64decode(body_b64)
+                        await self._save_generated_artifacts(
+                            artifacts=artifacts,
+                            requested_path=message.get("primary_path", requested_path),
+                        )
                     except ValueError as error:
-                        self.logger.warning("Meta job %s body decode failed: %s", meta_job_id, error)
+                        self.logger.warning("Meta job %s returned invalid bundle: %s", meta_job_id, error)
                         return False
 
-                    await self._save_generated_meta(
-                        requested_path=message.get("path", requested_path),
-                        headers=message.get("headers", []),
-                        body_bytes=body_bytes,
+                    self.logger.info(
+                        "Stored generated meta bundle for path %s with %s artifacts",
+                        requested_path,
+                        len(artifacts),
                     )
-                    self.logger.info("Stored generated meta content for path %s", requested_path)
                     return True
 
                 if state == "failed":

@@ -1,3 +1,5 @@
+import base64
+import json
 import argparse
 import asyncio
 import os
@@ -66,6 +68,34 @@ class TestParseSeedEndpoints(unittest.TestCase):
 
         self.assertEqual(summary, {"requested": 1, "skipped": 0, "generated": 0, "failed": 1})
         self.handler.poll_meta_job.assert_not_called()
+
+    def test_save_generated_artifacts_persists_bundle_paths(self):
+        artifacts = [
+            {
+                "path": "/missing",
+                "headers": [{"Content-Type": "text/plain; charset=utf-8"}],
+                "body_b64": base64.b64encode(b"secret=value\n").decode("ascii"),
+                "status_code": 200,
+            },
+            {
+                "path": "/robots.txt",
+                "headers": [{"Content-Type": "text/plain; charset=utf-8"}],
+                "body_b64": base64.b64encode(b"User-agent: *\nDisallow: /private\n").decode("ascii"),
+                "status_code": 200,
+            },
+        ]
+
+        self.loop.run_until_complete(self.handler._save_generated_artifacts(artifacts, "/missing"))
+
+        self.assertIn("/missing", self.handler.meta)
+        self.assertIn("/robots.txt", self.handler.meta)
+        with open(os.path.join(self.temp_dir, "meta.json")) as meta_file:
+            persisted_meta = json.load(meta_file)
+        self.assertIn("/missing", persisted_meta)
+        self.assertIn("/robots.txt", persisted_meta)
+        with open(os.path.join(self.temp_dir, self.handler.meta["/robots.txt"]["hash"]), "rb") as content_file:
+            self.assertEqual(content_file.read(), b"User-agent: *\nDisallow: /private\n")
+
 
     def tearDown(self):
         self.loop.close()

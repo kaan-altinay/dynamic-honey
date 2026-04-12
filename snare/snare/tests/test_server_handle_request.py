@@ -5,6 +5,7 @@ import argparse
 import shutil
 import multidict
 import os
+import tempfile
 import aiohttp
 from aiohttp.http_parser import RawRequestMessage
 from aiohttp import HttpVersion
@@ -21,8 +22,7 @@ class TestHandleRequest(unittest.TestCase):
         run_args = argparse.ArgumentParser()
         run_args.add_argument("--tanner")
         run_args.add_argument("--page-dir")
-        self.main_page_path = generate_unique_path()
-        os.makedirs(self.main_page_path)
+        self.main_page_path = tempfile.mkdtemp(prefix="snare-handle-request-")
         self.page_dir = self.main_page_path.rsplit("/")[-1]
         args = run_args.parse_args(["--page-dir", self.page_dir])
         args_dict = vars(args)
@@ -133,6 +133,33 @@ class TestHandleRequest(unittest.TestCase):
 
         self.loop.run_until_complete(test())
         self.handler.tanner_handler.parse_tanner_response.assert_called_with(self.request.path_qs, {"type": 1})
+
+    def test_meta_job_background_poll_is_scheduled_for_runtime_miss(self):
+        event_result = dict(
+            response=dict(
+                message=dict(
+                    detection={"type": 3, "payload": {"status_code": 404}},
+                    sess_uuid="test_uuid",
+                    meta_job_id="job-123",
+                )
+            )
+        )
+        self.handler.tanner_handler.submit_data = AsyncMock(return_value=event_result)
+        self.handler.tanner_handler.poll_meta_job = AsyncMock()
+
+        def capture_background_task(coroutine, task_name):
+            self.captured_task_name = task_name
+            coroutine.close()
+
+        self.handler._schedule_background_task = Mock(side_effect=capture_background_task)
+
+        async def test():
+            await self.handler.handle_request(self.request)
+
+        self.loop.run_until_complete(test())
+        self.assertEqual(self.captured_task_name, "poll_meta_job")
+        self.handler._schedule_background_task.assert_called_once()
+
 
     def tearDown(self):
         shutil.rmtree(self.main_page_path)
