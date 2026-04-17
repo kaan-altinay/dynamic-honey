@@ -336,6 +336,10 @@ src, dst, mode = sys.argv[1:4]
 text = Path(src).read_text()
 if mode == "default":
     text = re.sub(r'(^\s*backend:\s*).*$','\\1none', text, flags=re.M)
+    for emulator_key in ("lfi", "cmd_exec", "template_injection"):
+        text = re.sub(rf'(^\s*{re.escape(emulator_key)}:\s*).*$','\\1False', text, flags=re.M)
+text = re.sub(r'(^\s*log_debug:\s*).*$','\\1/var/log/tanner/tanner.log', text, flags=re.M)
+text = re.sub(r'(^\s*log_err:\s*).*$','\\1/var/log/tanner/tanner.err', text, flags=re.M)
 Path(dst).write_text(text)
 PY
 }
@@ -437,6 +441,7 @@ services:
     command: ["/opt/tanner/tanner-env/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
     volumes:
       - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
+      - '/var/run/docker.sock:/var/run/docker.sock'
     depends_on:
       - tanner_api
       - tanner_web

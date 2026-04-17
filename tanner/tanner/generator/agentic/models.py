@@ -83,13 +83,118 @@ class HeaderHint(ModelBase):
     value: str
 
 
-class StructuredArtifactDraft(ModelBase):
+class LinkSpec(ModelBase):
+    label: str
+    href: str
+
+
+class FormFieldSpec(ModelBase):
+    name: str
+    label: str
+    type: str
+
+
+class FormSpec(ModelBase):
+    action: str
+    method: str
+    fields: list[FormFieldSpec] = Field(default_factory=list)
+    submit_label: str
+
+
+class HtmlPageContent(ModelBase):
+    title: str
+    heading: str
+    paragraphs: list[str] = Field(default_factory=list)
+    nav_links: list[LinkSpec] = Field(default_factory=list)
+    linked_stylesheets: list[str] = Field(default_factory=list)
+    linked_scripts: list[str] = Field(default_factory=list)
+    form: FormSpec | None = None
+    footer: str = ""
+
+
+class ConfigEntry(ModelBase):
+    key: str
+    value: str
+
+
+class ConfigTextContent(ModelBase):
+    format: Literal["env", "php", "dotenv"] = "env"
+    comment: str | None = None
+    entries: list[ConfigEntry] = Field(default_factory=list)
+
+
+class CssDeclaration(ModelBase):
+    property: str
+    value: str
+
+
+class StylesheetRule(ModelBase):
+    selector: str
+    declarations: list[CssDeclaration] = Field(default_factory=list)
+
+
+class StylesheetContent(ModelBase):
+    rules: list[StylesheetRule] = Field(default_factory=list)
+
+
+class LineArtifactContent(ModelBase):
+    lines: list[str] = Field(default_factory=list)
+
+
+class SitemapContent(ModelBase):
+    urls: list[str] = Field(default_factory=list)
+
+
+class StructuredDraftBase(ModelBase):
     artifact_id: str
     path: str
-    kind: ArtifactKind
-    content_model_json: str = Field(min_length=2)
     headers_hint: list[HeaderHint] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
+
+
+class StructuredHtmlPageDraft(StructuredDraftBase):
+    kind: Literal["html_page"] = "html_page"
+    content_model: HtmlPageContent
+
+
+class StructuredConfigTextDraft(StructuredDraftBase):
+    kind: Literal["config_text"] = "config_text"
+    content_model: ConfigTextContent
+
+
+class StructuredStylesheetDraft(StructuredDraftBase):
+    kind: Literal["stylesheet"] = "stylesheet"
+    content_model: StylesheetContent
+
+
+class StructuredJavascriptDraft(StructuredDraftBase):
+    kind: Literal["javascript"] = "javascript"
+    content_model: LineArtifactContent
+
+
+class StructuredRobotsTxtDraft(StructuredDraftBase):
+    kind: Literal["robots_txt"] = "robots_txt"
+    content_model: LineArtifactContent
+
+
+class StructuredSitemapDraft(StructuredDraftBase):
+    kind: Literal["sitemap_xml"] = "sitemap_xml"
+    content_model: SitemapContent
+
+
+class StructuredCredentialBaitDraft(StructuredDraftBase):
+    kind: Literal["credential_bait"] = "credential_bait"
+    content_model: LineArtifactContent
+
+
+class StructuredLogExcerptDraft(StructuredDraftBase):
+    kind: Literal["log_excerpt"] = "log_excerpt"
+    content_model: LineArtifactContent
+
+
+class StructuredBackupManifestDraft(StructuredDraftBase):
+    kind: Literal["backup_manifest"] = "backup_manifest"
+    content_model: LineArtifactContent
 
 
 class ArtifactDraft(ModelBase):
@@ -100,6 +205,7 @@ class ArtifactDraft(ModelBase):
     headers_hint: list[dict[str, str]] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
     plan_revision: int = Field(default=0, ge=0)
+
 
 class GeneratedArtifact(ModelBase):
     path: str
@@ -116,6 +222,12 @@ class GeneratedBundle(ModelBase):
     artifacts: list[GeneratedArtifact]
     review_summary: str
     used_fallback: bool = False
+
+
+class StructuredReviewDecision(ModelBase):
+    decision: Literal["approve", "revise", "fallback"]
+    reasons: list[str] | None = None
+    required_fixes: list[str] | None = None
 
 
 class ReviewDecision(ModelBase):

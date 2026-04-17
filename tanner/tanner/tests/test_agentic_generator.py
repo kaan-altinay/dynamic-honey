@@ -10,9 +10,10 @@ from tanner.generator.agentic.models import (
     GeneratorRoleConfig,
     GeneratorRuntimeConfig,
     HeaderHint,
+    HtmlPageContent,
     PlannedArtifact,
     ResourcePlan,
-    StructuredArtifactDraft,
+    StructuredHtmlPageDraft,
  )
 from tanner.generator.agentic.fallback import build_fallback_bundle
 from tanner.generator.agentic.renderers import render_artifact
@@ -111,11 +112,18 @@ class TestAgenticBundleGenerator(unittest.TestCase):
 
     def test_materialize_structured_draft_parses_closed_schema_payload(self):
         generator = NoModelGenerator(runtime_config=self._runtime_config())
-        structured_draft = StructuredArtifactDraft(
+        structured_draft = StructuredHtmlPageDraft(
             artifact_id="wp-login-page",
             path="/wp-admin/login.php",
-            kind="html_page",
-            content_model_json='{"title": "Login", "heading": "Login", "paragraphs": ["Prompt"], "nav_links": [], "linked_stylesheets": [], "linked_scripts": [], "footer": "Footer"}',
+            content_model=HtmlPageContent(
+                title="Login",
+                heading="Login",
+                paragraphs=["Prompt"],
+                nav_links=[],
+                linked_stylesheets=[],
+                linked_scripts=[],
+                footer="Footer",
+            ),
             headers_hint=[HeaderHint(name="Content-Type", value="text/html; charset=utf-8")],
             review_notes=["note"],
         )

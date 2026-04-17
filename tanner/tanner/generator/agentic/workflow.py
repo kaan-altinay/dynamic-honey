@@ -24,7 +24,16 @@ from tanner.generator.agentic.models import (
     PlannedArtifact,
     ResourcePlan,
     ReviewDecision,
-    StructuredArtifactDraft,
+    StructuredBackupManifestDraft,
+    StructuredConfigTextDraft,
+    StructuredCredentialBaitDraft,
+    StructuredHtmlPageDraft,
+    StructuredJavascriptDraft,
+    StructuredLogExcerptDraft,
+    StructuredReviewDecision,
+    StructuredRobotsTxtDraft,
+    StructuredSitemapDraft,
+    StructuredStylesheetDraft,
  )
 from tanner.generator.agentic.renderers import render_artifact
 from tanner.generator.agentic.tools import inspect_reference, sandbox_command, web_research
@@ -214,23 +223,49 @@ class AgenticBundleGenerator(BaseGenerator):
     def _header_hints_to_dicts(header_hints):
         return [{header_hint.name: header_hint.value} for header_hint in header_hints]
 
+    @staticmethod
+    def _coder_schema_for_kind(kind: str):
+        schema_by_kind = {
+            "html_page": StructuredHtmlPageDraft,
+            "config_text": StructuredConfigTextDraft,
+            "stylesheet": StructuredStylesheetDraft,
+            "javascript": StructuredJavascriptDraft,
+            "robots_txt": StructuredRobotsTxtDraft,
+            "sitemap_xml": StructuredSitemapDraft,
+            "credential_bait": StructuredCredentialBaitDraft,
+            "log_excerpt": StructuredLogExcerptDraft,
+            "backup_manifest": StructuredBackupManifestDraft,
+        }
+        try:
+            return schema_by_kind[kind]
+        except KeyError as error:
+            raise ValueError("Unsupported coder schema for kind {}".format(kind)) from error
+
+    def _normalize_structured_content_model(self, kind: str, content_model) -> dict[str, object]:
+        raw_content_model = content_model.model_dump(exclude_none=True)
+        if kind == "stylesheet":
+            for rule in raw_content_model.get("rules", []):
+                rule["declarations"] = {
+                    declaration["property"]: declaration["value"]
+                    for declaration in rule.get("declarations", [])
+                }
+        if kind == "config_text" and raw_content_model.get("format") == "dotenv":
+            raw_content_model["format"] = "env"
+        return raw_content_model
+
     def _materialize_structured_draft(
         self,
-        structured_draft: StructuredArtifactDraft,
+        structured_draft,
         plan_revision: int,
     ) -> ArtifactDraft:
-        try:
-            content_model = json.loads(structured_draft.content_model_json)
-        except json.JSONDecodeError as error:
-            raise ValueError("content_model_json must be valid JSON") from error
-        if not isinstance(content_model, dict):
-            raise ValueError("content_model_json must decode to an object")
-
         return ArtifactDraft(
             artifact_id=structured_draft.artifact_id,
             path=structured_draft.path,
             kind=structured_draft.kind,
-            content_model=content_model,
+            content_model=self._normalize_structured_content_model(
+                structured_draft.kind,
+                structured_draft.content_model,
+            ),
             headers_hint=self._header_hints_to_dicts(structured_draft.headers_hint),
             review_notes=structured_draft.review_notes,
             plan_revision=plan_revision,
@@ -260,7 +295,7 @@ class AgenticBundleGenerator(BaseGenerator):
                 "entries": [{"key": "<config-key>", "value": "<config-value>"}],
             },
             "stylesheet": {
-                "rules": [{"selector": "<css selector>", "declarations": {"<property>": "<value>"}}],
+                "rules": [{"selector": "<css selector>", "declarations": [{"property": "<property>", "value": "<value>"}]}],
             },
             "javascript": {
                 "lines": ["<javascript line>", "<javascript line>"],
@@ -300,6 +335,14 @@ class AgenticBundleGenerator(BaseGenerator):
                 )
             )
         return "\n\n".join(evidence_sections)
+
+    @staticmethod
+    def _normalize_review_decision(structured_decision: StructuredReviewDecision) -> ReviewDecision:
+        return ReviewDecision(
+            decision=structured_decision.decision,
+            reasons=structured_decision.reasons or [],
+            required_fixes=structured_decision.required_fixes or [],
+        )
 
     async def _normalize_request_node(self, state: GraphState):
         request = GenerationRequest.model_validate(state["request"])
@@ -434,13 +477,13 @@ class AgenticBundleGenerator(BaseGenerator):
             self._content_model_skeleton_for_kind(artifact.kind),
             sort_keys=True,
         )
+        draft_schema = self._coder_schema_for_kind(artifact.kind)
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are a Coder role generating one static artifact draft. "
-                    "Return a StructuredArtifactDraft only. "
-                    "The content_model_json field must be a valid JSON object encoded as a string. "
+                    "Return only the typed structured draft for the requested artifact kind. "
                     "headers_hint must be a list of {name,value} objects. Do not invent additional files. "
                     "Never use internal planning words such as fake, lure, attacker, attackers, or honeypot in served text, comments, titles, footers, or file content."
                 ),
@@ -454,7 +497,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Artifact purpose: {purpose}\n"
                     "Related links: {links}\n"
                     "Environment theme: {theme}\n"
-                    "Use this abstract content_model skeleton only as a shape guide; replace every placeholder with concrete artifact content: {content_model_skeleton}"
+                    "Use this abstract content-model skeleton only as a shape guide; replace every placeholder with concrete artifact content: {content_model_skeleton}"
                 ).format(
                     path=request.normalized_path,
                     artifact_path=artifact.path,
@@ -468,8 +511,8 @@ class AgenticBundleGenerator(BaseGenerator):
         ]
 
         try:
-            structured_draft = await self._invoke_structured("coder", StructuredArtifactDraft, messages)
-            structured_draft = StructuredArtifactDraft.model_validate(structured_draft)
+            structured_draft = await self._invoke_structured("coder", draft_schema, messages)
+            structured_draft = draft_schema.model_validate(structured_draft)
             draft = self._materialize_structured_draft(structured_draft, plan_revision)
             validate_artifact_draft(draft, request)
         except Exception as error:
@@ -553,8 +596,9 @@ class AgenticBundleGenerator(BaseGenerator):
         ]
 
         try:
-            decision = await self._invoke_structured("review", ReviewDecision, messages)
-            decision = ReviewDecision.model_validate(decision)
+            structured_decision = await self._invoke_structured("review", StructuredReviewDecision, messages)
+            structured_decision = StructuredReviewDecision.model_validate(structured_decision)
+            decision = self._normalize_review_decision(structured_decision)
         except Exception as error:
             self.logger.info("Falling back to deterministic review for %s: %s", request.normalized_path, error)
             decision = ReviewDecision(decision="approve", reasons=["deterministic validation passed"], required_fixes=[])
