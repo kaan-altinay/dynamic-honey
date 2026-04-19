@@ -24,8 +24,10 @@ ArtifactKind = Literal[
     "credential_bait",
     "log_excerpt",
     "backup_manifest",
+    "asset_file",
 ]
 
+AssetFetchKind = Literal["image", "stylesheet", "script", "icon", "font", "other"]
 ArtifactScope = Literal["static_file", "dynamic_endpoint", "service_stub"]
 RoleName = Literal["expert", "design", "coder", "review"]
 
@@ -54,6 +56,20 @@ class ExpertSpec(ModelBase):
     references: list[str] = Field(default_factory=list)
 
 
+class PlannedAssetFetch(ModelBase):
+    asset_id: str
+    source_url: str
+    local_path: str
+    kind: AssetFetchKind
+    required_for_artifact_ids: list[str] = Field(default_factory=list)
+    reason: str
+
+
+class ReferenceAssetPlan(ModelBase):
+    reference_urls: list[str] = Field(default_factory=list)
+    asset_fetches: list[PlannedAssetFetch] = Field(default_factory=list)
+
+
 class PlannedArtifact(ModelBase):
     artifact_id: str
     path: str
@@ -72,6 +88,7 @@ class ResourcePlan(ModelBase):
     primary_path: str
     theme_summary: str
     artifacts: list[PlannedArtifact]
+    reference_asset_plan: ReferenceAssetPlan = Field(default_factory=ReferenceAssetPlan)
     bundle_budget_count: int = Field(ge=1)
     bundle_budget_bytes: int = Field(ge=1)
     static_only: bool = True
@@ -86,6 +103,13 @@ class HeaderHint(ModelBase):
 class LinkSpec(ModelBase):
     label: str
     href: str
+
+
+class ImageSpec(ModelBase):
+    src: str
+    alt: str
+    href: str | None = None
+    class_name: str | None = None
 
 
 class FormFieldSpec(ModelBase):
@@ -106,6 +130,7 @@ class HtmlPageContent(ModelBase):
     heading: str
     paragraphs: list[str] = Field(default_factory=list)
     nav_links: list[LinkSpec] = Field(default_factory=list)
+    images: list[ImageSpec] = Field(default_factory=list)
     linked_stylesheets: list[str] = Field(default_factory=list)
     linked_scripts: list[str] = Field(default_factory=list)
     form: FormSpec | None = None
@@ -205,6 +230,49 @@ class ArtifactDraft(ModelBase):
     headers_hint: list[dict[str, str]] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
     plan_revision: int = Field(default=0, ge=0)
+
+
+class AssetCandidate(ModelBase):
+    source_url: str
+    kind: AssetFetchKind
+    tag: str
+    local_path_hint: str
+    note: str = ""
+
+
+class ReferencePage(ModelBase):
+    url: str
+    final_url: str
+    title: str = ""
+    text_excerpt: str = ""
+    asset_candidates: list[AssetCandidate] = Field(default_factory=list)
+
+
+class FetchedAsset(ModelBase):
+    asset_id: str
+    source_url: str
+    local_path: str
+    kind: AssetFetchKind
+    content_type: str
+    body_bytes: bytes
+    required_for_artifact_ids: list[str] = Field(default_factory=list)
+
+
+class ArtifactReferenceContext(ModelBase):
+    artifact_id: str
+    reference_urls: list[str] = Field(default_factory=list)
+    local_asset_paths: list[str] = Field(default_factory=list)
+    allowed_local_asset_paths: list[str] = Field(default_factory=list)
+    allowed_internal_paths: list[str] = Field(default_factory=list)
+    primary_path: str = "/index.html"
+    forbidden_external_assets: bool = True
+    notes: list[str] = Field(default_factory=list)
+
+
+class ReferencePack(ModelBase):
+    reference_pages: list[ReferencePage] = Field(default_factory=list)
+    fetched_assets: list[FetchedAsset] = Field(default_factory=list)
+    artifact_contexts: list[ArtifactReferenceContext] = Field(default_factory=list)
 
 
 class GeneratedArtifact(ModelBase):

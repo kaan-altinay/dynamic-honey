@@ -285,9 +285,10 @@ class TannerServer:
 
     async def delete_sessions(self):
         try:
+            delay = self.delete_timeout if isinstance(self.delete_timeout, (int, float)) and self.delete_timeout > 0 else 300
             while True:
                 await self.session_manager.delete_old_sessions(self.redis_client)
-                await asyncio.sleep(self.delete_timeout)
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             pass
 

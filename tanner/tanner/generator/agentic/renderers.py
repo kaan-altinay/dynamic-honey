@@ -34,6 +34,7 @@ def _render_html(draft: ArtifactDraft) -> bytes:
     heading = html.escape(model.get("heading", title))
     paragraphs = [html.escape(value) for value in model.get("paragraphs", []) if isinstance(value, str)]
     nav_links = [link for link in model.get("nav_links", []) if isinstance(link, dict)]
+    images = [image for image in model.get("images", []) if isinstance(image, dict)]
     stylesheet_links = [link for link in model.get("linked_stylesheets", []) if isinstance(link, str)]
     script_links = [link for link in model.get("linked_scripts", []) if isinstance(link, str)]
     form = model.get("form") if isinstance(model.get("form"), dict) else None
@@ -54,6 +55,29 @@ def _render_html(draft: ArtifactDraft) -> bytes:
         ]
         nav_html = "<nav><ul>{}</ul></nav>".format("".join(nav_items))
 
+    image_html = ""
+    if images:
+        rendered_images = []
+        for image in images:
+            src = html.escape(image.get("src", ""), quote=True)
+            if not src:
+                continue
+            alt = html.escape(image.get("alt", ""))
+            class_name = image.get("class_name")
+            class_attr = "" if not isinstance(class_name, str) or not class_name.strip() else ' class="{}"'.format(html.escape(class_name, quote=True))
+            tag = '<img src="{src}" alt="{alt}"{class_attr}>'.format(
+                src=src,
+                alt=alt,
+                class_attr=class_attr,
+            )
+            href = image.get("href")
+            if isinstance(href, str) and href.strip():
+                tag = '<a href="{href}">{tag}</a>'.format(
+                    href=html.escape(href, quote=True),
+                    tag=tag,
+                )
+            rendered_images.append(tag)
+        image_html = "".join(rendered_images)
     paragraph_html = "".join("<p>{}</p>".format(paragraph) for paragraph in paragraphs)
     form_html = ""
     if form:
@@ -67,14 +91,14 @@ def _render_html(draft: ArtifactDraft) -> bytes:
             label = html.escape(field.get("label", name))
             field_type = html.escape(field.get("type", "text"), quote=True)
             fields.append(
-                '<label>{label}<input type="{type}" name="{name}" autocomplete="off"></label>'.format(
+                '<label>{label}<input class="input" id="{name}" type="{type}" name="{name}" autocomplete="off"></label>'.format(
                     label=label,
                     type=field_type,
                     name=name,
                 )
             )
         submit_label = html.escape(form.get("submit_label", "Continue"))
-        form_html = '<form action="{action}" method="{method}">{fields}<button type="submit">{submit}</button></form>'.format(
+        form_html = '<form id="loginform" action="{action}" method="{method}">{fields}<button class="button" type="submit">{submit}</button></form>'.format(
             action=action,
             method=method,
             fields="".join(fields),
@@ -85,13 +109,18 @@ def _render_html(draft: ArtifactDraft) -> bytes:
         '<script src="{}"></script>'.format(html.escape(script, quote=True)) for script in script_links
     )
 
+    body_is_login = form is not None or any(token in draft.path.lower() for token in ["login", "wp-admin"])
+    body_open = "<body class=\"login\">" if body_is_login else "<body>"
+
     document = "".join(
         [
             "<!DOCTYPE html>",
             "<html lang=\"en\"><head>",
             "".join(head_parts),
-            "</head><body>",
+            "</head>",
+            body_open,
             nav_html,
+            image_html,
             "<main><section><h1>{}</h1>{}{}</section></main>".format(heading, paragraph_html, form_html),
             "<footer><small>{}</small></footer>".format(footer),
             script_html,
