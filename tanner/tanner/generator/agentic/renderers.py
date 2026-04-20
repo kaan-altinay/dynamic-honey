@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import html
+import json
 import re
 from typing import Iterable
 
@@ -167,6 +169,12 @@ def _render_config_text(draft: ArtifactDraft) -> bytes:
     return (_join_lines(lines) + "\n").encode("utf-8")
 
 
+def _render_json_document(draft: ArtifactDraft) -> bytes:
+    document = draft.content_model.get("document")
+    if not isinstance(document, dict):
+        document = {}
+    return (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
 def _render_stylesheet(draft: ArtifactDraft) -> bytes:
     rules = []
     for rule in draft.content_model.get("rules", []):
@@ -202,6 +210,23 @@ def _render_sitemap(draft: ArtifactDraft) -> bytes:
     return ('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{}</urlset>'.format(body)).encode("utf-8")
 
 
+def _render_xml_document(draft: ArtifactDraft) -> bytes:
+    lines = [line for line in draft.content_model.get("lines", []) if isinstance(line, str)]
+    return (_join_lines(lines) + "\n").encode("utf-8")
+
+
+def _render_binary_asset(draft: ArtifactDraft) -> bytes:
+    content_base64 = draft.content_model.get("content_base64")
+    if not isinstance(content_base64, str):
+        raise ValueError("binary_asset content_base64 must be a string")
+    try:
+        payload = base64.b64decode(content_base64, validate=True)
+    except Exception as error:
+        raise ValueError("binary_asset content_base64 is invalid") from error
+    if not payload:
+        raise ValueError("binary_asset payload is empty")
+    return payload
+
 def render_artifact(draft: ArtifactDraft) -> GeneratedArtifact:
     if draft.kind == "html_page":
         body = _render_html(draft)
@@ -209,6 +234,16 @@ def render_artifact(draft: ArtifactDraft) -> GeneratedArtifact:
     elif draft.kind == "config_text":
         body = _render_config_text(draft)
         content_type = "text/plain; charset=utf-8"
+    elif draft.kind == "json_document":
+        body = _render_json_document(draft)
+        content_type = "application/json; charset=utf-8"
+    elif draft.kind == "plain_text":
+        body = _render_plaintext(draft)
+        content_type = "text/plain; charset=utf-8"
+    elif draft.kind == "binary_asset":
+        body = _render_binary_asset(draft)
+        raw_content_type = draft.content_model.get("content_type")
+        content_type = raw_content_type if isinstance(raw_content_type, str) and raw_content_type.strip() else "application/octet-stream"
     elif draft.kind == "stylesheet":
         body = _render_stylesheet(draft)
         content_type = "text/css; charset=utf-8"
@@ -220,6 +255,9 @@ def render_artifact(draft: ArtifactDraft) -> GeneratedArtifact:
         content_type = "text/plain; charset=utf-8"
     elif draft.kind == "sitemap_xml":
         body = _render_sitemap(draft)
+        content_type = "application/xml; charset=utf-8"
+    elif draft.kind == "xml_document":
+        body = _render_xml_document(draft)
         content_type = "application/xml; charset=utf-8"
     else:
         raise ValueError("Unsupported artifact kind {}".format(draft.kind))

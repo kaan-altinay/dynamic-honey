@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from string import Template
 from typing import Any
@@ -102,6 +103,64 @@ def _fit_drafts_to_budget(drafts: list[ArtifactDraft], max_artifacts: int | None
         budgeted_drafts.append(draft.model_copy(update={"content_model": content_model}))
 
     return budgeted_drafts
+
+
+def _required_kind_for_path(path: str) -> str | None:
+    lowered = path.lower()
+    if lowered == "/robots.txt":
+        return "robots_txt"
+    if lowered == "/sitemap.xml":
+        return "sitemap_xml"
+    if lowered.endswith(".xml"):
+        return "xml_document"
+    if lowered.endswith(".json"):
+        return "json_document"
+    if lowered.endswith(".txt"):
+        return "plain_text"
+    if lowered.endswith((".ico", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".woff", ".woff2", ".ttf", ".otf")):
+        return "binary_asset"
+    return None
+
+
+def _binary_asset_content_type_for_path(path: str) -> str:
+    lowered = path.lower()
+    if lowered.endswith(".ico"):
+        return "image/x-icon"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".bmp"):
+        return "image/bmp"
+    if lowered.endswith(".svg"):
+        return "image/svg+xml"
+    if lowered.endswith(".woff"):
+        return "font/woff"
+    if lowered.endswith(".woff2"):
+        return "font/woff2"
+    if lowered.endswith(".ttf"):
+        return "font/ttf"
+    if lowered.endswith(".otf"):
+        return "font/otf"
+    return "application/octet-stream"
+
+
+def _binary_asset_stub_base64(path: str) -> str:
+    lowered = path.lower()
+    if lowered.endswith(".png") or lowered.endswith(".ico"):
+        return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7bRz4AAAAASUVORK5CYII="
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBUQEBAVFRUVFRUVFRUVFRUVFRUVFRUXFhUVFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OFQ8QFS0dHR0tLS0rKy0tLSstKy0rKy0tLS0tLS0tLS0tLS0tLSstLS0tLS0tLS0tKy0tLS0tK//AABEIAAEAAQMBIgACEQEDEQH/xAAXAAEAAwAAAAAAAAAAAAAAAAAAAAUG/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEAMQAAAB9A//xAAZEAEAAwEBAAAAAAAAAAAAAAABAAIRITH/2gAIAQEAAT8A0YxW4VxYf//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8Af//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8Af//Z"
+    if lowered.endswith(".gif"):
+        return "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+    if lowered.endswith(".svg"):
+        svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>"
+        return base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return base64.b64encode(b"binary-asset").decode("ascii")
 
 
 FALLBACK_PROFILES: dict[str, FallbackProfile] = {
@@ -277,6 +336,226 @@ INTENT_TO_FALLBACK_PROFILE = {
 }
 
 
+def _build_xml_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    primary_path = request.normalized_path
+    support_candidates = ["/WANCfgSCPD.xml", "/WANIPConnSCPD.xml"]
+    support_paths = [candidate for candidate in support_candidates if candidate != primary_path]
+    if not support_paths:
+        support_paths = ["/device.xml"]
+
+    primary_lines = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">",
+        "  <specVersion><major>1</major><minor>0</minor></specVersion>",
+        "  <URLBase>http://10.44.12.1:1900/</URLBase>",
+        "  <device>",
+        "    <friendlyName>Northbridge Branch Gateway</friendlyName>",
+        "    <modelName>{}</modelName>".format(primary_path.rsplit("/", 1)[-1] or "descriptor.xml"),
+        "    <serviceList>",
+        "      <service>",
+        "        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>",
+        "        <SCPDURL>{}</SCPDURL>".format(support_paths[0]),
+        "      </service>",
+        "    </serviceList>",
+        "  </device>",
+        "</root>",
+    ]
+
+    drafts = [
+        ArtifactDraft(
+            artifact_id="xml-primary",
+            path=primary_path,
+            kind="xml_document",
+            content_model={"lines": primary_lines},
+            review_notes=["fallback profile xml_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="xml-support-a",
+            path=support_paths[0],
+            kind="xml_document",
+            content_model={
+                "lines": [
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                    "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">",
+                    "  <specVersion><major>1</major><minor>0</minor></specVersion>",
+                    "  <actionList><action><name>GetStatusInfo</name></action></actionList>",
+                    "</scpd>",
+                ]
+            },
+            review_notes=["fallback profile xml_recon"],
+        ),
+    ]
+
+    if len(support_paths) > 1:
+        drafts.append(
+            ArtifactDraft(
+                artifact_id="xml-support-b",
+                path=support_paths[1],
+                kind="xml_document",
+                content_model={
+                    "lines": [
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">",
+                        "  <specVersion><major>1</major><minor>0</minor></specVersion>",
+                        "  <actionList><action><name>GetExternalIPAddress</name></action></actionList>",
+                        "</scpd>",
+                    ]
+                },
+                review_notes=["fallback profile xml_recon"],
+            )
+        )
+    return drafts
+
+
+def _build_json_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    primary_path = request.normalized_path
+    support_path = "/version" if primary_path != "/version" else "/info"
+    return [
+        ArtifactDraft(
+            artifact_id="json-primary",
+            path=primary_path,
+            kind="json_document",
+            content_model={
+                "document": {
+                    "status": "ok",
+                    "path": primary_path,
+                    "service": "fallback-json",
+                }
+            },
+            review_notes=["fallback profile json_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="json-support-text",
+            path=support_path,
+            kind="plain_text",
+            content_model={"lines": ["service endpoint: {}".format(support_path), "status: ok"]},
+            review_notes=["fallback profile json_recon"],
+        ),
+    ]
+
+
+def _build_plain_text_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    primary_path = request.normalized_path
+    support_path = "/version" if primary_path != "/version" else "/info"
+    return [
+        ArtifactDraft(
+            artifact_id="text-primary",
+            path=primary_path,
+            kind="plain_text",
+            content_model={"lines": ["service endpoint: {}".format(primary_path), "status: ok"]},
+            review_notes=["fallback profile text_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="text-support",
+            path=support_path,
+            kind="plain_text",
+            content_model={"lines": ["service endpoint: {}".format(support_path), "status: ok"]},
+            review_notes=["fallback profile text_recon"],
+        ),
+    ]
+
+
+def _build_binary_asset_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    primary_path = request.normalized_path
+    return [
+        ArtifactDraft(
+            artifact_id="binary-primary",
+            path=primary_path,
+            kind="binary_asset",
+            content_model={
+                "content_type": _binary_asset_content_type_for_path(primary_path),
+                "content_base64": _binary_asset_stub_base64(primary_path),
+            },
+            review_notes=["fallback profile binary_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="binary-index",
+            path="/index.html",
+            kind="html_page",
+            content_model={
+                "title": "Asset Index",
+                "heading": "Asset Index",
+                "paragraphs": ["Static asset endpoint available."],
+                "nav_links": [{"label": "Primary asset", "href": primary_path}],
+                "images": [{"src": primary_path, "alt": "asset"}],
+                "linked_stylesheets": [],
+                "linked_scripts": [],
+                "form": None,
+                "footer": "Static asset preview",
+            },
+            review_notes=["fallback profile binary_recon"],
+        ),
+    ]
+
+
+def _build_robots_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    return [
+        ArtifactDraft(
+            artifact_id="robots-primary",
+            path=request.normalized_path,
+            kind="robots_txt",
+            content_model={"lines": ["User-agent: *", "Disallow: /private", "Disallow: /admin"]},
+            review_notes=["fallback profile robots_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="robots-index",
+            path="/index.html",
+            kind="html_page",
+            content_model={
+                "title": "Service Index",
+                "heading": "Service Index",
+                "paragraphs": ["Crawler policy is available."],
+                "nav_links": [{"label": "robots", "href": request.normalized_path}],
+                "images": [],
+                "linked_stylesheets": [],
+                "linked_scripts": [],
+                "form": None,
+                "footer": "Service resources",
+            },
+            review_notes=["fallback profile robots_recon"],
+        ),
+    ]
+
+
+def _build_sitemap_fallback_drafts(request: GenerationRequest) -> list[ArtifactDraft]:
+    primary_path = request.normalized_path
+    return [
+        ArtifactDraft(
+            artifact_id="sitemap-primary",
+            path=primary_path,
+            kind="sitemap_xml",
+            content_model={"urls": [primary_path, "/robots.txt", "/index.html"]},
+            review_notes=["fallback profile sitemap_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="sitemap-robots",
+            path="/robots.txt",
+            kind="robots_txt",
+            content_model={"lines": ["User-agent: *", "Disallow: /private", "Disallow: /admin"]},
+            review_notes=["fallback profile sitemap_recon"],
+        ),
+        ArtifactDraft(
+            artifact_id="sitemap-index",
+            path="/index.html",
+            kind="html_page",
+            content_model={
+                "title": "Service Index",
+                "heading": "Service Index",
+                "paragraphs": ["Sitemap endpoint is published."],
+                "nav_links": [
+                    {"label": "sitemap", "href": primary_path},
+                    {"label": "robots", "href": "/robots.txt"},
+                ],
+                "images": [],
+                "linked_stylesheets": [],
+                "linked_scripts": [],
+                "form": None,
+                "footer": "Service resources",
+            },
+            review_notes=["fallback profile sitemap_recon"],
+        ),
+    ]
+
 def build_fallback_bundle(
     request: GenerationRequest,
     expert_spec: ExpertSpec | None = None,
@@ -284,8 +563,28 @@ def build_fallback_bundle(
     max_artifacts: int | None = None,
  ) -> GeneratedBundle:
     intent_family = expert_spec.intent_family if expert_spec is not None else infer_intent_family(request.normalized_path)
-    profile_name = INTENT_TO_FALLBACK_PROFILE.get(intent_family, "generic_recon")
-    drafts = _build_profile_drafts(request, profile_name)
+    required_kind = _required_kind_for_path(request.normalized_path)
+    if required_kind == "xml_document":
+        profile_name = "xml_recon"
+        drafts = _build_xml_fallback_drafts(request)
+    elif required_kind == "json_document":
+        profile_name = "json_recon"
+        drafts = _build_json_fallback_drafts(request)
+    elif required_kind == "plain_text":
+        profile_name = "text_recon"
+        drafts = _build_plain_text_fallback_drafts(request)
+    elif required_kind == "binary_asset":
+        profile_name = "binary_recon"
+        drafts = _build_binary_asset_fallback_drafts(request)
+    elif required_kind == "robots_txt":
+        profile_name = "robots_recon"
+        drafts = _build_robots_fallback_drafts(request)
+    elif required_kind == "sitemap_xml":
+        profile_name = "sitemap_recon"
+        drafts = _build_sitemap_fallback_drafts(request)
+    else:
+        profile_name = INTENT_TO_FALLBACK_PROFILE.get(intent_family, "generic_recon")
+        drafts = _build_profile_drafts(request, profile_name)
     drafts = _fit_drafts_to_budget(drafts, max_artifacts)
     artifacts = [render_artifact(draft) for draft in drafts]
     review_bits = reasons or ["used deterministic fallback profile {}".format(profile_name)]

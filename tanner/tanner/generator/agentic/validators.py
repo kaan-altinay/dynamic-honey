@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 from typing import Iterable
 from urllib.parse import unquote, urlsplit
@@ -22,6 +23,20 @@ _JS_PATH_LITERAL_RE = re.compile(r"[\"'](/[^\"'\s?#]+(?:\?[^\"']*)?)[\"']")
 _JS_EXTERNAL_URL_RE = re.compile(r"https?://[^\"'\s)]+", re.I)
 _CONFIG_THEFT_SUPPORT_KINDS = {"config_text", "log_excerpt", "backup_manifest", "credential_bait"}
 _INTERNAL_LANGUAGE_RE = re.compile(r"\b(fake|lure|attacker|attackers|honeypot)\b", re.I)
+_BINARY_ASSET_EXTENSIONS = (
+    ".ico",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+)
 
 
 class ValidationError(ValueError):
@@ -84,6 +99,23 @@ def _has_config_theft_support(artifacts, primary_path: str) -> bool:
 def _is_cms_login_html_path(path: str) -> bool:
     lowered = path.lower()
     return lowered == "/wp-login.php" or (lowered.startswith("/wp-admin/") and "login" in lowered)
+
+
+def _required_primary_kind_for_path(path: str) -> str | None:
+    lowered = path.lower()
+    if lowered == "/robots.txt":
+        return "robots_txt"
+    if lowered == "/sitemap.xml":
+        return "sitemap_xml"
+    if lowered.endswith(".xml"):
+        return "xml_document"
+    if lowered.endswith(".json"):
+        return "json_document"
+    if lowered.endswith(".txt"):
+        return "plain_text"
+    if lowered.endswith(_BINARY_ASSET_EXTENSIONS):
+        return "binary_asset"
+    return None
 
 
 def _planned_output_count(plan: ResourcePlan) -> int:
@@ -202,6 +234,24 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
     if request.normalized_path not in normalized_paths:
         raise ValidationError("plan must include the primary requested path")
 
+    required_primary_kind = _required_primary_kind_for_path(request.normalized_path)
+    if required_primary_kind is not None:
+        primary_artifact = next((artifact for artifact in plan.artifacts if artifact.path == request.normalized_path), None)
+        if primary_artifact is None:
+            raise ValidationError(
+                "plan must include a generated primary artifact at {} for extension-enforced kind {}".format(
+                    request.normalized_path,
+                    required_primary_kind,
+                )
+            )
+        if primary_artifact.kind != required_primary_kind:
+            raise ValidationError(
+                "primary requested path {} requires artifact kind {} (got {})".format(
+                    request.normalized_path,
+                    required_primary_kind,
+                    primary_artifact.kind,
+                )
+            )
     artifact_id_set = set(artifact_ids)
     for artifact in plan.artifacts:
         validate_planned_artifact(artifact, request)
@@ -262,6 +312,10 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
 def validate_planned_artifact(artifact: PlannedArtifact, request: GenerationRequest) -> None:
     if artifact.artifact_scope != "static_file":
         raise ValidationError("unsupported artifact scope {}".format(artifact.artifact_scope))
+    if artifact.kind == "asset_file":
+        raise ValidationError(
+            "planned artifact kind asset_file is unsupported for coder generation; use reference_asset_plan.asset_fetches for binary assets"
+        )
     if normalize_path(artifact.path, index_page=request.index_page) != artifact.path:
         raise ValidationError("artifact path is not normalized: {}".format(artifact.path))
 
@@ -278,7 +332,41 @@ def validate_artifact_draft(draft: ArtifactDraft, request: GenerationRequest) ->
         raise ValidationError("draft path is not normalized: {}".format(draft.path))
     if not isinstance(draft.content_model, dict) or not draft.content_model:
         raise ValidationError("draft content_model must be a non-empty object")
+    required_primary_kind = _required_primary_kind_for_path(draft.path)
+    if required_primary_kind is not None and draft.kind != required_primary_kind:
+        raise ValidationError(
+            "draft path {} requires kind {} (got {})".format(
+                draft.path,
+                required_primary_kind,
+                draft.kind,
+            )
+        )
 
+    if draft.kind == "json_document":
+        document = draft.content_model.get("document")
+        if not isinstance(document, dict) or not document:
+            raise ValidationError("json_document draft must provide non-empty content_model.document object")
+
+    if draft.kind == "plain_text":
+        lines = draft.content_model.get("lines")
+        if not isinstance(lines, list) or not any(isinstance(line, str) and line.strip() for line in lines):
+            raise ValidationError("plain_text draft must provide non-empty content_model.lines")
+
+    if draft.kind == "binary_asset":
+        content_type = draft.content_model.get("content_type")
+        if not isinstance(content_type, str) or not content_type.strip():
+            raise ValidationError("binary_asset draft must provide non-empty content_model.content_type")
+
+        content_base64 = draft.content_model.get("content_base64")
+        if not isinstance(content_base64, str) or not content_base64.strip():
+            raise ValidationError("binary_asset draft must provide non-empty content_model.content_base64")
+
+        try:
+            decoded = base64.b64decode(content_base64, validate=True)
+        except Exception as error:
+            raise ValidationError("binary_asset draft has invalid base64 payload") from error
+        if not decoded:
+            raise ValidationError("binary_asset draft base64 payload decodes to empty bytes")
 
 def validate_artifact_draft_contract(
     draft: ArtifactDraft,
@@ -406,12 +494,13 @@ def validate_generated_artifact(artifact: GeneratedArtifact, request: Generation
     ):
         raise ValidationError("generated artifact missing content-type header")
 
-    decoded_body = artifact.body_bytes.decode("utf-8", errors="ignore")
-    internal_term_match = _INTERNAL_LANGUAGE_RE.search(decoded_body)
-    if internal_term_match is not None:
-        raise ValidationError(
-            "generated artifact leaked internal planning language: {}".format(internal_term_match.group(1))
-        )
+    if artifact.kind != "binary_asset":
+        decoded_body = artifact.body_bytes.decode("utf-8", errors="ignore")
+        internal_term_match = _INTERNAL_LANGUAGE_RE.search(decoded_body)
+        if internal_term_match is not None:
+            raise ValidationError(
+                "generated artifact leaked internal planning language: {}".format(internal_term_match.group(1))
+            )
 
 
 def extract_html_references(body: bytes) -> list[str]:
@@ -498,6 +587,19 @@ def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime
     if request.normalized_path not in available_paths:
         raise ValidationError("bundle is missing the primary requested artifact")
 
+    required_primary_kind = _required_primary_kind_for_path(request.normalized_path)
+    if required_primary_kind is not None:
+        primary_artifact = next((artifact for artifact in bundle.artifacts if artifact.path == request.normalized_path), None)
+        if primary_artifact is None:
+            raise ValidationError("bundle is missing the primary requested artifact")
+        if primary_artifact.kind != required_primary_kind:
+            raise ValidationError(
+                "bundle primary artifact {} requires kind {} (got {})".format(
+                    request.normalized_path,
+                    required_primary_kind,
+                    primary_artifact.kind,
+                )
+            )
     allowed_paths = available_paths | _allowed_baseline_paths(request)
     for artifact in bundle.artifacts:
         if artifact.kind == "html_page":

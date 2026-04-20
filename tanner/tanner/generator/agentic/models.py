@@ -17,10 +17,14 @@ IntentFamily = Literal[
 ArtifactKind = Literal[
     "html_page",
     "config_text",
+    "json_document",
+    "plain_text",
+    "binary_asset",
     "stylesheet",
     "javascript",
     "robots_txt",
     "sitemap_xml",
+    "xml_document",
     "credential_bait",
     "log_excerpt",
     "backup_manifest",
@@ -49,7 +53,7 @@ class ExpertSpec(ModelBase):
     intent_family: IntentFamily
     attacker_goal: str
     confidence: float = Field(ge=0.0, le=1.0)
-    primary_resource_kind: str
+    primary_resource_kind: ArtifactKind
     lure_requirements: list[str] = Field(default_factory=list)
     supporting_context: list[str] = Field(default_factory=list)
     environment_theme: str
@@ -169,6 +173,15 @@ class LineArtifactContent(ModelBase):
 class SitemapContent(ModelBase):
     urls: list[str] = Field(default_factory=list)
 
+class JsonDocumentContent(ModelBase):
+    document: dict[str, Any] = Field(default_factory=dict)
+
+
+class BinaryAssetContent(ModelBase):
+    content_type: str = "application/octet-stream"
+    content_base64: str
+
+
 
 class StructuredDraftBase(ModelBase):
     artifact_id: str
@@ -187,6 +200,11 @@ class StructuredConfigTextDraft(StructuredDraftBase):
     content_model: ConfigTextContent
 
 
+class StructuredJsonDocumentDraft(StructuredDraftBase):
+    kind: Literal["json_document"] = "json_document"
+    content_model: JsonDocumentContent
+
+
 class StructuredStylesheetDraft(StructuredDraftBase):
     kind: Literal["stylesheet"] = "stylesheet"
     content_model: StylesheetContent
@@ -199,6 +217,11 @@ class StructuredJavascriptDraft(StructuredDraftBase):
 
 class StructuredRobotsTxtDraft(StructuredDraftBase):
     kind: Literal["robots_txt"] = "robots_txt"
+    content_model: LineArtifactContent
+
+
+class StructuredPlainTextDraft(StructuredDraftBase):
+    kind: Literal["plain_text"] = "plain_text"
     content_model: LineArtifactContent
 
 
@@ -220,6 +243,16 @@ class StructuredLogExcerptDraft(StructuredDraftBase):
 class StructuredBackupManifestDraft(StructuredDraftBase):
     kind: Literal["backup_manifest"] = "backup_manifest"
     content_model: LineArtifactContent
+
+class StructuredBinaryAssetDraft(StructuredDraftBase):
+    kind: Literal["binary_asset"] = "binary_asset"
+    content_model: BinaryAssetContent
+
+
+class StructuredXmlDocumentDraft(StructuredDraftBase):
+    kind: Literal["xml_document"] = "xml_document"
+    content_model: LineArtifactContent
+
 
 
 class ArtifactDraft(ModelBase):
@@ -294,8 +327,8 @@ class GeneratedBundle(ModelBase):
 
 class StructuredReviewDecision(ModelBase):
     decision: Literal["approve", "revise", "fallback"]
-    reasons: list[str] | None = None
-    required_fixes: list[str] | None = None
+    reasons: list[str] = Field(default_factory=list)
+    required_fixes: list[str] = Field(default_factory=list)
 
 
 class ReviewDecision(ModelBase):

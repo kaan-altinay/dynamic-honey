@@ -340,6 +340,7 @@ if mode == "default":
         text = re.sub(rf'(^\s*{re.escape(emulator_key)}:\s*).*$','\\1False', text, flags=re.M)
 text = re.sub(r'(^\s*log_debug:\s*).*$','\\1/var/log/tanner/tanner.log', text, flags=re.M)
 text = re.sub(r'(^\s*log_err:\s*).*$','\\1/var/log/tanner/tanner.err', text, flags=re.M)
+text = re.sub(r'(^\s*REDIS:\s*\n(?:.*\n)*?\s*host:\s*).*$','\\1tanner_redis', text, flags=re.M)
 Path(dst).write_text(text)
 PY
 }

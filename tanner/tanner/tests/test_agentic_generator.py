@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import os
 import tempfile
 import unittest
@@ -127,8 +129,18 @@ class TestAgenticBundleGenerator(unittest.TestCase):
             headers_hint=[HeaderHint(name="Content-Type", value="text/html; charset=utf-8")],
             review_notes=["note"],
         )
+        planned_artifact = PlannedArtifact(
+            artifact_id="wp-login-page",
+            path="/wp-admin/login.php",
+            kind="html_page",
+            purpose="Primary WordPress login page",
+        )
 
-        draft = generator._materialize_structured_draft(structured_draft, plan_revision=3)
+        draft = generator._materialize_structured_draft(
+            structured_draft,
+            artifact=planned_artifact,
+            plan_revision=3,
+        )
 
         self.assertEqual(draft.plan_revision, 3)
         self.assertEqual(draft.content_model["title"], "Login")
@@ -226,6 +238,329 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_plan(plan, request, runtime_config)
 
+    def test_cms_probe_login_plan_requires_stylesheet_artifact(self):
+        request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        plan = ResourcePlan(
+            primary_path="/wp-admin/login.php",
+            theme_summary="WordPress login surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login-admin",
+                    path="/wp-admin/login.php",
+                    kind="html_page",
+                    purpose="Primary login page",
+                    links_to=["/wp-login.php"],
+                ),
+                PlannedArtifact(
+                    artifact_id="login-canonical",
+                    path="/wp-login.php",
+                    kind="html_page",
+                    purpose="Canonical login page",
+                    links_to=["/wp-admin/login.php"],
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=8_192,
+            static_only=True,
+            review_focus=["cms_probe"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+    def test_cms_probe_login_plan_accepts_linked_stylesheet_artifact(self):
+        request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        stylesheet_path = "/wp-content/themes/twentytwenty/style.css"
+        plan = ResourcePlan(
+            primary_path="/wp-admin/login.php",
+            theme_summary="WordPress login surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login-admin",
+                    path="/wp-admin/login.php",
+                    kind="html_page",
+                    purpose="Primary login page",
+                    links_to=["/wp-login.php", stylesheet_path],
+                ),
+                PlannedArtifact(
+                    artifact_id="login-canonical",
+                    path="/wp-login.php",
+                    kind="html_page",
+                    purpose="Canonical login page",
+                    links_to=["/wp-admin/login.php", stylesheet_path],
+                ),
+                PlannedArtifact(
+                    artifact_id="wp-style",
+                    path=stylesheet_path,
+                    kind="stylesheet",
+                    purpose="Shared login stylesheet",
+                ),
+            ],
+            bundle_budget_count=3,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["cms_probe"],
+        )
+
+        validate_plan(plan, request, runtime_config)
+
+
+    def test_plan_rejects_generated_asset_file_artifacts(self):
+        request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        stylesheet_path = "/wp-content/themes/twentytwenty/style.css"
+        plan = ResourcePlan(
+            primary_path="/wp-admin/login.php",
+            theme_summary="WordPress login surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login-admin",
+                    path="/wp-admin/login.php",
+                    kind="html_page",
+                    purpose="Primary login page",
+                    links_to=[stylesheet_path],
+                ),
+                PlannedArtifact(
+                    artifact_id="wp-style",
+                    path=stylesheet_path,
+                    kind="stylesheet",
+                    purpose="Shared login stylesheet",
+                ),
+                PlannedArtifact(
+                    artifact_id="logo",
+                    path="/wp-admin/images/wordpress-logo.svg",
+                    kind="asset_file",
+                    purpose="Logo binary asset",
+                ),
+            ],
+            bundle_budget_count=3,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["cms_probe"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+
+    def test_xml_plan_requires_xml_document_primary_kind(self):
+        request = ensure_generation_request("example.com", "/gatedesc.xml", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        plan = ResourcePlan(
+            primary_path="/gatedesc.xml",
+            theme_summary="UPnP descriptor surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="primary-xml",
+                    path="/gatedesc.xml",
+                    kind="config_text",
+                    purpose="Incorrectly modeled XML payload as config text",
+                ),
+                PlannedArtifact(
+                    artifact_id="support-xml",
+                    path="/WANCfgSCPD.xml",
+                    kind="xml_document",
+                    purpose="Supporting descriptor",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["framework_probe"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+    def test_xml_plan_accepts_xml_document_primary_kind(self):
+        request = ensure_generation_request("example.com", "/gatedesc.xml", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        plan = ResourcePlan(
+            primary_path="/gatedesc.xml",
+            theme_summary="UPnP descriptor surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="primary-xml",
+                    path="/gatedesc.xml",
+                    kind="xml_document",
+                    purpose="Primary gateway descriptor",
+                    links_to=["/WANCfgSCPD.xml"],
+                ),
+                PlannedArtifact(
+                    artifact_id="support-xml",
+                    path="/WANCfgSCPD.xml",
+                    kind="xml_document",
+                    purpose="Supporting descriptor",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["framework_probe"],
+        )
+
+        validate_plan(plan, request, runtime_config)
+
+    def test_render_xml_document_artifact_outputs_application_xml(self):
+        artifact = render_artifact(
+            ArtifactDraft(
+                artifact_id="xml-primary",
+                path="/gatedesc.xml",
+                kind="xml_document",
+                content_model={
+                    "lines": [
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<root><child>value</child></root>",
+                    ]
+                },
+            )
+        )
+
+        self.assertEqual(artifact.kind, "xml_document")
+        self.assertEqual(
+            artifact.body_bytes.decode("utf-8"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root><child>value</child></root>\n",
+        )
+        self.assertTrue(
+            any(
+                isinstance(header, dict) and header.get("Content-Type") == "application/xml; charset=utf-8"
+                for header in artifact.headers
+            )
+        )
+
+    def test_fallback_bundle_for_xml_request_uses_xml_primary(self):
+        request = ensure_generation_request("example.com", "/gatedesc.xml", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=4)
+        bundle = build_fallback_bundle(request, max_artifacts=runtime_config.max_bundle_artifacts)
+
+        primary = next((artifact for artifact in bundle.artifacts if artifact.path == "/gatedesc.xml"), None)
+        self.assertIsNotNone(primary)
+        self.assertEqual(primary.kind, "xml_document")
+        validate_bundle(bundle, request, runtime_config)
+
+
+    def test_json_plan_requires_json_document_primary_kind(self):
+        request = ensure_generation_request("example.com", "/api/status.json", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        plan = ResourcePlan(
+            primary_path="/api/status.json",
+            theme_summary="JSON endpoint surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="primary-json",
+                    path="/api/status.json",
+                    kind="html_page",
+                    purpose="Incorrectly modeled JSON endpoint",
+                ),
+                PlannedArtifact(
+                    artifact_id="support-text",
+                    path="/version",
+                    kind="plain_text",
+                    purpose="Support metadata endpoint",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["framework_probe"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+    def test_plain_text_plan_requires_plain_text_primary_kind(self):
+        request = ensure_generation_request("example.com", "/status.txt", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=6)
+        plan = ResourcePlan(
+            primary_path="/status.txt",
+            theme_summary="Plain text endpoint surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="primary-text",
+                    path="/status.txt",
+                    kind="html_page",
+                    purpose="Incorrectly modeled text endpoint",
+                ),
+                PlannedArtifact(
+                    artifact_id="support-text",
+                    path="/version",
+                    kind="plain_text",
+                    purpose="Support metadata endpoint",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["generic_recon"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+    def test_render_json_document_artifact_outputs_application_json(self):
+        artifact = render_artifact(
+            ArtifactDraft(
+                artifact_id="json-primary",
+                path="/api/status.json",
+                kind="json_document",
+                content_model={"document": {"status": "ok", "version": "1.0.0"}},
+            )
+        )
+
+        self.assertEqual(artifact.kind, "json_document")
+        self.assertEqual(json.loads(artifact.body_bytes.decode("utf-8")), {"status": "ok", "version": "1.0.0"})
+        self.assertTrue(
+            any(
+                isinstance(header, dict) and header.get("Content-Type") == "application/json; charset=utf-8"
+                for header in artifact.headers
+            )
+        )
+
+    def test_render_binary_asset_artifact_outputs_binary_bytes(self):
+        payload = b"\x00\x01\x02abc"
+        artifact = render_artifact(
+            ArtifactDraft(
+                artifact_id="binary-primary",
+                path="/favicon.ico",
+                kind="binary_asset",
+                content_model={
+                    "content_type": "image/x-icon",
+                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                },
+            )
+        )
+
+        self.assertEqual(artifact.kind, "binary_asset")
+        self.assertEqual(artifact.body_bytes, payload)
+        self.assertTrue(
+            any(
+                isinstance(header, dict) and header.get("Content-Type") == "image/x-icon"
+                for header in artifact.headers
+            )
+        )
+
+    def test_fallback_bundle_for_json_request_uses_json_primary(self):
+        request = ensure_generation_request("example.com", "/api/status.json", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=4)
+        bundle = build_fallback_bundle(request, max_artifacts=runtime_config.max_bundle_artifacts)
+
+        primary = next((artifact for artifact in bundle.artifacts if artifact.path == "/api/status.json"), None)
+        self.assertIsNotNone(primary)
+        self.assertEqual(primary.kind, "json_document")
+        validate_bundle(bundle, request, runtime_config)
+
+    def test_fallback_bundle_for_binary_request_uses_binary_primary(self):
+        request = ensure_generation_request("example.com", "/favicon.ico", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=4)
+        bundle = build_fallback_bundle(request, max_artifacts=runtime_config.max_bundle_artifacts)
+
+        primary = next((artifact for artifact in bundle.artifacts if artifact.path == "/favicon.ico"), None)
+        self.assertIsNotNone(primary)
+        self.assertEqual(primary.kind, "binary_asset")
+        validate_bundle(bundle, request, runtime_config)
+
     def test_validate_bundle_rejects_internal_language_leak(self):
         request = ensure_generation_request("example.com", "/status", {"index_page": "/index.html"})
         runtime_config = self._runtime_config(max_bundle_artifacts=2)
@@ -248,6 +583,29 @@ class TestAgenticBundleGenerator(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             validate_bundle(bundle, request, runtime_config)
+
+
+    def test_validate_bundle_allows_index_page_baseline_link(self):
+        request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=2)
+        bundle = GeneratedBundle(
+            primary_path="/wp-admin/login.php",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/wp-admin/login.php",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html; charset=utf-8"}],
+                    body_bytes=b'<html><body><a href="/index.html">Home</a></body></html>',
+                    status_code=200,
+                    source_artifact_id="page",
+                    artifact_scope="static_file",
+                )
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        validate_bundle(bundle, request, runtime_config)
 
 
     def test_coder_fanout_generates_one_worker_per_planned_artifact(self):
