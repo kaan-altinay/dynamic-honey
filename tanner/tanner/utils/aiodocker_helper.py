@@ -9,8 +9,12 @@ class AIODockerHelper:
 
         self.logger = logging.getLogger("tanner.aiodocker_helper.AIODockerHelper")
 
-        self.docker_client = aiodocker.Docker()
+        self.docker_client = None
         self.host_image = TannerConfig.get("DOCKER", "host_image")
+
+    def _ensure_client(self):
+        if self.docker_client is None:
+            self.docker_client = aiodocker.Docker()
 
     async def setup_host_image(self, remote_path=None, tag=None):
         """
@@ -18,6 +22,8 @@ class AIODockerHelper:
         :param remote_path (str): remote path of Dockerfile
         :param tag (str): tag to be given to new image build ex: 'myimage:latest'
         """
+
+        self._ensure_client()
 
         try:
             if remote_path and tag is not None:
@@ -38,6 +44,7 @@ class AIODockerHelper:
         :param container_name (str): name of the target container
         :return: container (object)
         """
+        self._ensure_client()
         container = None
         try:
             container = await self.docker_client.containers.get(container=container_name)
@@ -54,6 +61,7 @@ class AIODockerHelper:
         :param image (str): name of image to be used
         :return: container (object): newly created container object
         """
+        self._ensure_client()
         await self.setup_host_image()
         container = None
         if image is None:
@@ -74,6 +82,7 @@ class AIODockerHelper:
         :param image (str): name of image to be used
         :return: execute_result (str): execution output/errors of cmd from the container
         """
+        self._ensure_client()
         execute_result = None
         try:
             if image is None:

@@ -2,8 +2,12 @@ import asyncio
 import base64
 import json
 import logging
+import re
+import time
 import yarl
 import uuid
+
+from collections import defaultdict, deque
 
 from aiohttp import web
 
@@ -18,6 +22,155 @@ from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
 from tanner import __version__ as tanner_version
 
+
+class MetaGenerationPolicy:
+    _HIGH_VALUE_PATH_RE = re.compile(
+        r"(^/(api(?:/|$)|login|admin|wsman|_all_dbs|containers/json|solr(?:/|$)|v1/|_nodes|_stats|_cat/indices|json/version|_config|hnap1|tr064dev\.xml|nacos/|hazelcast/|clientwebservice/|manager/html|jmx|invoker/readonly|health|actuator/health))",
+        re.IGNORECASE,
+    )
+    _SCANNER_UA_RE = re.compile(
+        r"censys|zgrab|shodan|go-http-client|python-requests|curl/|python-httpx|masscan|nmap|libredtail",
+        re.IGNORECASE,
+    )
+    _STATIC_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|svg|ico|css|js|map|woff2?|ttf|eot)(?:$|\?)", re.IGNORECASE)
+    _EXPLOIT_PATH_RE = re.compile(
+        r"\.\.|%2e|/bin/sh|php-cgi|eval-stdin|allow_url_include|auto_prepend_file|gponform|^/mcp$",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, logger):
+        self.logger = logger
+        self.enabled = self._as_bool(self._config_value("meta_policy_enabled", True))
+        self.min_distinct_ips = int(self._config_value("meta_policy_min_distinct_ips", 2))
+        self.min_recent_hits = int(self._config_value("meta_policy_min_recent_hits", 3))
+        self.recent_window_seconds = int(self._config_value("meta_policy_recent_window_seconds", 86400))
+        self.per_ip_cooldown_seconds = int(self._config_value("meta_policy_per_ip_cooldown_seconds", 1800))
+        self.hourly_budget = int(self._config_value("meta_policy_hourly_budget", 10))
+        self.daily_budget = int(self._config_value("meta_policy_daily_budget", 120))
+        self.max_path_length = int(self._config_value("meta_policy_max_path_length", 120))
+        self.require_non_ua_positive = self._as_bool(self._config_value("meta_policy_require_non_ua_positive", True))
+        pending_ttl_default = min(self.per_ip_cooldown_seconds, 600) if self.per_ip_cooldown_seconds > 0 else 600
+        self.pending_ttl_seconds = int(self._config_value("meta_policy_pending_ttl_seconds", pending_ttl_default))
+
+        self._path_events = defaultdict(deque)
+        self._last_generation_by_ip = {}
+        self._pending_paths = {}
+        self._hourly_counts = defaultdict(int)
+        self._daily_counts = defaultdict(int)
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(value, (int, float)):
+            return value != 0
+        return bool(value)
+
+    @staticmethod
+    def _config_value(key, default):
+        try:
+            return TannerConfig.get("GENERATOR", key)
+        except KeyError:
+            return default
+
+    @staticmethod
+    def _looks_random_path(path):
+        segments = [segment for segment in path.split("/") if segment]
+        if not segments:
+            return False
+        token = max(segments, key=len)
+        if token.startswith("."):
+            return False
+        if len(token) < 14:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+            return False
+        unique_ratio = len(set(token)) / float(len(token))
+        return unique_ratio > 0.65
+
+    def _record_observation(self, path, src_ip, now):
+        queue = self._path_events[path]
+        queue.append((now, src_ip or ""))
+        cutoff = now - self.recent_window_seconds
+        while queue and queue[0][0] < cutoff:
+            queue.popleft()
+
+        recent_count = len(queue)
+        distinct_ips = len({ip for _, ip in queue if ip})
+        return recent_count, distinct_ips
+
+    def _prune_pending_paths(self, now):
+        if self.pending_ttl_seconds <= 0:
+            return
+        expired_paths = [path for path, ts in self._pending_paths.items() if now - ts > self.pending_ttl_seconds]
+        for expired in expired_paths:
+            self._pending_paths.pop(expired, None)
+
+    def should_generate(self, path, method=None, src_ip=None, user_agent=None):
+        if not self.enabled:
+            return True, "policy_disabled"
+
+        now = time.time()
+        method = (method or "").upper()
+        path = path if isinstance(path, str) and path else "/"
+        src_ip = src_ip or ""
+        user_agent = user_agent or ""
+
+        recent_count, distinct_ips = self._record_observation(path, src_ip, now)
+        self._prune_pending_paths(now)
+
+        if method not in {"GET", "HEAD"}:
+            return False, "method_not_allowed"
+        if not path.startswith("/"):
+            return False, "not_normalized_path"
+        if len(path) < 1 or len(path) > self.max_path_length:
+            return False, "path_length_filtered"
+        if self._STATIC_EXT_RE.search(path):
+            return False, "static_extension_filtered"
+        if path in self._pending_paths:
+            return False, "path_generation_pending"
+
+        is_high_value = bool(self._HIGH_VALUE_PATH_RE.search(path))
+        has_distinct_ips = distinct_ips >= self.min_distinct_ips
+        has_recent_hits = recent_count >= self.min_recent_hits
+        scanner_ua = bool(self._SCANNER_UA_RE.search(user_agent))
+
+        is_random = self._looks_random_path(path)
+        exploit_like = bool(self._EXPLOIT_PATH_RE.search(path))
+
+        if is_random or exploit_like:
+            return False, "negative_signal"
+
+        positive_any = is_high_value or has_distinct_ips or has_recent_hits or scanner_ua
+        non_ua_positive = is_high_value or has_distinct_ips or has_recent_hits
+
+        if not positive_any:
+            return False, "no_positive_signal"
+        if self.require_non_ua_positive and not non_ua_positive:
+            return False, "ua_only_positive"
+
+        if src_ip and self.per_ip_cooldown_seconds > 0:
+            last_generated = self._last_generation_by_ip.get(src_ip)
+            if last_generated and (now - last_generated) < self.per_ip_cooldown_seconds:
+                return False, "per_ip_cooldown"
+
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(now))
+        hour_key = time.strftime("%Y-%m-%d %H", time.gmtime(now))
+
+        if self.hourly_budget > 0 and self._hourly_counts[hour_key] >= self.hourly_budget:
+            return False, "hourly_budget_exhausted"
+        if self.daily_budget > 0 and self._daily_counts[day_key] >= self.daily_budget:
+            return False, "daily_budget_exhausted"
+
+        if src_ip:
+            self._last_generation_by_ip[src_ip] = now
+        self._hourly_counts[hour_key] += 1
+        self._daily_counts[day_key] += 1
+        self._pending_paths[path] = now
+        return True, "scheduled"
+
 class TannerServer:
     def __init__(self):
         base_dir = TannerConfig.get("EMULATORS", "root_dir")
@@ -31,6 +184,7 @@ class TannerServer:
         self.logger = logging.getLogger(__name__)
         self.redis_client = None
         self.generator = self._build_generator()
+        self.meta_generation_policy = MetaGenerationPolicy(self.logger)
 
         if TannerConfig.get("HPFEEDS", "enabled") is True:
             self.hpf = hpfeeds_report()
@@ -164,10 +318,29 @@ class TannerServer:
             meta_probe = data.get("meta_probe")
             meta_probe_hit = meta_probe.get("hit") if isinstance(meta_probe, dict) else None
             if meta_probe_hit is False:
-                meta_job_id = str(uuid.uuid4())
-                await self._save_meta_job(meta_job_id, {"state": "pending", "path": path})
                 host = self._extract_host(data)
-                asyncio.create_task(self._run_meta_job(meta_job_id, host, path, meta_probe))
+                headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
+                user_agent = headers.get("User-Agent", "")
+                src_ip = data.get("peer", {}).get("ip") if isinstance(data.get("peer"), dict) else None
+
+                should_generate, policy_reason = self.meta_generation_policy.should_generate(
+                    path=path,
+                    method=data.get("method"),
+                    src_ip=src_ip,
+                    user_agent=user_agent,
+                )
+                self.logger.info(
+                    "Meta generation policy for path %s: allowed=%s reason=%s",
+                    path,
+                    should_generate,
+                    policy_reason,
+                )
+
+                if should_generate:
+                    meta_job_id = str(uuid.uuid4())
+                    await self._save_meta_job(meta_job_id, {"state": "pending", "path": path})
+                    asyncio.create_task(self._run_meta_job(meta_job_id, host, path, meta_probe))
+
                 detection["type"] = 3
                 detection["payload"] = {"status_code": 404}
 

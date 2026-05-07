@@ -14,6 +14,8 @@ class TestAgenticGeneratorConfig(unittest.TestCase):
             ("GENERATOR", "max_bundle_artifacts"): 5,
             ("GENERATOR", "max_bundle_bytes"): 99_999,
             ("GENERATOR", "checkpoint_path"): "/tmp/test-checkpoints.sqlite",
+            ("GENERATOR", "graph_recursion_limit"): 180,
+            ("GENERATOR", "review_log_path"): "/tmp/test-review-log.json",
             ("GENERATOR", "enable_live_research"): False,
             ("GENERATOR", "max_tool_response_chars"): 1024,
             ("GENERATOR", "max_command_output_chars"): 2048,
@@ -48,6 +50,8 @@ class TestAgenticGeneratorConfig(unittest.TestCase):
         self.assertEqual(runtime_config.max_review_loops, 3)
         self.assertEqual(runtime_config.max_bundle_artifacts, 5)
         self.assertFalse(runtime_config.enable_live_research)
+        self.assertEqual(runtime_config.graph_recursion_limit, 180)
+        self.assertEqual(runtime_config.review_log_path, "/tmp/test-review-log.json")
         self.assertEqual(runtime_config.max_concurrent_model_calls, 1)
         self.assertEqual(runtime_config.inter_call_delay_seconds, 9.5)
         self.assertEqual(runtime_config.max_rate_limit_retries, 4)

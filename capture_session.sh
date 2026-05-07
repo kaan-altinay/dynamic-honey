@@ -29,6 +29,11 @@ Options:
   --captures-dir <path>   Artifact root (default: ./captures_new)
   --iface <name>          Capture interface (default: eth0)
   --page-url <host>       Snare page-dir / PAGE_URL (default: example.com)
+  --forward-ports <list>  Comma-separated host ports forwarded to Snare :80
+                          (default: 80,443,8080,8081,8000,8888,8443,9200,8983,5984,2375,6443,5000,8500,5701,8848,5985,5986,17778)
+  --cliproxy-dir <path>   Path to cli-proxy-api working directory (default: /home/kaan/cliproxyapi)
+  --cliproxy-cmd <cmd>    Command to launch backend from cliproxy-dir (default: ./cli-proxy-api)
+  --no-cliproxy-auto      Do not auto-start cli-proxy-api for agentic mode
   --build                 Rebuild images before starting services
   --dry-run               Print commands without executing
   -h, --help              Show this help
@@ -51,6 +56,9 @@ SNARE_TEMPLATE_DIR="/home/kaan/snare-data/snare"
 PUBLIC_IP_PREFIX="145.220.178"
 DEFAULT_PAGE_URL="example.com"
 DEFAULT_IFACE="eth0"
+DEFAULT_FORWARD_PORTS="80,443,8080,8081,8000,8888,8443,9200,8983,5984,2375,6443,5000,8500,5701,8848,5985,5986,17778"
+DEFAULT_CLIPROXY_DIR="/home/kaan/cliproxyapi"
+DEFAULT_CLIPROXY_CMD="./cli-proxy-api"
 
 COMMAND="${1:-}"
 if [[ -n "$COMMAND" ]]; then
@@ -65,6 +73,10 @@ IFACE="${DEFAULT_IFACE}"
 PAGE_URL="${DEFAULT_PAGE_URL}"
 BUILD=0
 DRY_RUN=0
+FORWARD_PORTS="${DEFAULT_FORWARD_PORTS}"
+CLIPROXY_DIR="${DEFAULT_CLIPROXY_DIR}"
+CLIPROXY_CMD="${DEFAULT_CLIPROXY_CMD}"
+CLIPROXY_AUTO=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -95,6 +107,22 @@ while [[ $# -gt 0 ]]; do
     --page-url)
       PAGE_URL="${2:-}"
       shift 2
+      ;;
+    --forward-ports)
+      FORWARD_PORTS="${2:-}"
+      shift 2
+      ;;
+    --cliproxy-dir)
+      CLIPROXY_DIR="${2:-}"
+      shift 2
+      ;;
+    --cliproxy-cmd)
+      CLIPROXY_CMD="${2:-}"
+      shift 2
+      ;;
+    --no-cliproxy-auto)
+      CLIPROXY_AUTO=0
+      shift
       ;;
     --build)
       BUILD=1
@@ -258,6 +286,43 @@ build_ip_list() {
   done
 }
 
+
+build_forward_port_list() {
+  if [[ -z "${FORWARD_PORTS}" ]]; then
+    echo "--forward-ports cannot be empty." >&2
+    exit 1
+  fi
+
+  FORWARD_PORT_LIST=()
+  local raw_port trimmed
+  local -A seen=()
+  IFS=',' read -r -a raw_ports <<<"${FORWARD_PORTS}"
+  for raw_port in "${raw_ports[@]}"; do
+    trimmed="${raw_port//[[:space:]]/}"
+    if [[ -z "${trimmed}" ]]; then
+      continue
+    fi
+    if [[ ! "${trimmed}" =~ ^[0-9]+$ ]]; then
+      echo "Invalid port in --forward-ports: ${trimmed}" >&2
+      exit 1
+    fi
+    if (( trimmed < 1 || trimmed > 65535 )); then
+      echo "Port out of range in --forward-ports: ${trimmed}" >&2
+      exit 1
+    fi
+    if [[ -n "${seen[${trimmed}]:-}" ]]; then
+      continue
+    fi
+    seen["${trimmed}"]=1
+    FORWARD_PORT_LIST+=("${trimmed}")
+  done
+
+  if (( ${#FORWARD_PORT_LIST[@]} == 0 )); then
+    echo "No valid ports resolved from --forward-ports." >&2
+    exit 1
+  fi
+}
+
 build_tcpdump_filter() {
   local host_parts=()
   local ip
@@ -319,6 +384,11 @@ seed_snare_state() {
       run_cmd cp "$SNARE_TEMPLATE_DIR/seedfile.txt" "$STATE_DIR/seedfile.txt"
     fi
   fi
+
+  # Snare drops privileges to nobody; grant runtime write access for dynamic cache updates.
+  if [[ -d "$STATE_DIR/pages/${PAGE_URL}" ]]; then
+    run_cmd chmod -R a+rwX "$STATE_DIR/pages/${PAGE_URL}"
+  fi
 }
 
 write_tanner_config() {
@@ -364,7 +434,7 @@ services:
       - local
     read_only: true
     tmpfs:
-      - /data
+      - /data:uid=65534,gid=65534
 
   tanner_phpox:
     build: '${ROOT_DIR}/tanner/docker/phpox'
@@ -456,9 +526,11 @@ EOF
 
 write_snare_compose() {
   local ports_block=""
-  local ip
+  local ip host_port
   for ip in "${IP_LIST[@]}"; do
-    ports_block+="      - '${ip}:80:80'"$'\n'
+    for host_port in "${FORWARD_PORT_LIST[@]}"; do
+      ports_block+="      - '${ip}:${host_port}:80'"$'\n'
+    done
   done
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -494,6 +566,49 @@ networks:
 EOF
 }
 
+
+ensure_cliproxy_for_agentic() {
+  if [[ "${MODE}" != "agentic" || "${CLIPROXY_AUTO}" -ne 1 ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] ensure cli-proxy-api via '${CLIPROXY_CMD}' in ${CLIPROXY_DIR}"
+    return 0
+  fi
+
+  if [[ ! -d "$CLIPROXY_DIR" ]]; then
+    echo "cli-proxy directory not found: $CLIPROXY_DIR" >&2
+    exit 1
+  fi
+
+  local existing_pid
+  existing_pid="$(pgrep -f '[c]li-proxy-api' | head -n 1 || true)"
+  if [[ -n "$existing_pid" ]]; then
+    echo "[info] cli-proxy-api already running (pid: ${existing_pid})"
+    echo "cliproxy_pid=${existing_pid}" >> "$RUN_INFO_PATH"
+    echo "cliproxy_started_by_run=0" >> "$RUN_INFO_PATH"
+    return 0
+  fi
+
+  local launch_cmd
+  printf -v launch_cmd 'cd %q && exec %q' "$CLIPROXY_DIR" "$CLIPROXY_CMD"
+
+  local cliproxy_log="${RUN_DIR}/cliproxy.log"
+  nohup bash -lc "$launch_cmd" >"$cliproxy_log" 2>&1 &
+  local cliproxy_pid=$!
+  sleep 1
+
+  if ! kill -0 "$cliproxy_pid" >/dev/null 2>&1; then
+    echo "Failed to start cli-proxy-api. Inspect log: ${cliproxy_log}" >&2
+    exit 1
+  fi
+
+  echo "[ok] cli-proxy-api started (pid: ${cliproxy_pid})"
+  echo "cliproxy_pid=${cliproxy_pid}" >> "$RUN_INFO_PATH"
+  echo "cliproxy_started_by_run=1" >> "$RUN_INFO_PATH"
+}
+
 write_run_info() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] write run metadata -> ${RUN_INFO_PATH}"
@@ -509,6 +624,7 @@ write_run_info() {
     printf 'ip_list=%q\n' "${IP_LIST[*]}"
     printf 'iface=%q\n' "$IFACE"
     printf 'page_url=%q\n' "$PAGE_URL"
+    printf 'forward_ports=%q\n' "${FORWARD_PORT_LIST[*]}"
     printf 'web_port=%q\n' "$WEB_PORT"
     printf 'tanner_compose=%q\n' "$TANNER_COMPOSE_PATH"
     printf 'snare_compose=%q\n' "$SNARE_COMPOSE_PATH"
@@ -522,6 +638,9 @@ write_run_info() {
     printf 'tanner_web_container=%q\n' "$TANNER_WEB_CONTAINER"
     printf 'tanner_redis_container=%q\n' "$TANNER_REDIS_CONTAINER"
     printf 'tanner_phpox_container=%q\n' "$TANNER_PHPOX_CONTAINER"
+    printf 'cliproxy_dir=%q\n' "$CLIPROXY_DIR"
+    printf 'cliproxy_cmd=%q\n' "$CLIPROXY_CMD"
+    printf 'cliproxy_auto=%q\n' "$CLIPROXY_AUTO"
   } > "$RUN_INFO_PATH"
 }
 
@@ -558,7 +677,7 @@ load_run_info() {
     raw_value="${line#*=}"
     printf -v value '%b' "${raw_value//\\ / }"
     case "$key" in
-      run_name|mode|project_name|network_name|range_start|range_end|ip_list|iface|page_url|web_port|tanner_compose|snare_compose|tanner_config|state_dir|pcap_path|tcpdump_log_path|snare_container|tanner_container|tanner_api_container|tanner_web_container|tanner_redis_container|tanner_phpox_container|tcpdump_pid)
+      run_name|mode|project_name|network_name|range_start|range_end|ip_list|iface|page_url|forward_ports|web_port|tanner_compose|snare_compose|tanner_config|state_dir|pcap_path|tcpdump_log_path|snare_container|tanner_container|tanner_api_container|tanner_web_container|tanner_redis_container|tanner_phpox_container|tcpdump_pid|cliproxy_pid|cliproxy_started_by_run|cliproxy_dir|cliproxy_cmd|cliproxy_auto)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -592,6 +711,7 @@ start_run() {
 
   parse_range
   build_ip_list
+  build_forward_port_list
   build_tcpdump_filter
   init_run_layout
 
@@ -611,8 +731,11 @@ start_run() {
   echo "[info] Starting run '${RUN_NAME}' (${MODE}) for ${PUBLIC_IP_PREFIX}.${RANGE_START}-${RANGE_END}"
   echo "[info] Capture dir: ${RUN_DIR}"
   echo "[info] Snare state: ${STATE_DIR}"
+  echo "[info] Forwarded host ports -> snare:80: ${FORWARD_PORT_LIST[*]}"
   echo "[info] Tanner web: http://127.0.0.1:${WEB_PORT}"
   echo "[info] tcpdump filter: ${TCPDUMP_FILTER}"
+
+  ensure_cliproxy_for_agentic
 
   run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans
   run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" down --remove-orphans
@@ -672,6 +795,12 @@ status_run() {
   echo "iface=${iface}"
   echo "pcap_path=${pcap_path}"
   echo "web_port=${web_port}"
+  echo "forward_ports=${forward_ports:-80}"
+  if [[ -n "${cliproxy_pid:-}" ]] && kill -0 "${cliproxy_pid}" >/dev/null 2>&1; then
+    echo "cliproxy=running pid=${cliproxy_pid} started_by_run=${cliproxy_started_by_run:-0}"
+  else
+    echo "cliproxy=stopped"
+  fi
 
   if [[ -n "${tcpdump_pid:-}" ]] && kill -0 "${tcpdump_pid}" >/dev/null 2>&1; then
     echo "tcpdump=running pid=${tcpdump_pid}"

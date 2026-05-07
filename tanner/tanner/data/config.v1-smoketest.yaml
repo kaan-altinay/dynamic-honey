@@ -11,102 +11,96 @@ TANNER:
   host: 0.0.0.0
   port: 8090
 
-WEB: 
+WEB:
   host: 0.0.0.0
   port: 8091
 
-API: 
+API:
   host: 0.0.0.0
   port: 8092
   auth: False
   auth_signature: tanner_api_auth
 
-PHPOX: 
+PHPOX:
   host: 0.0.0.0
   port: 8088
 
-REDIS: 
+REDIS:
   host: localhost
   port: 6379
-  poolsize: 80 
+  poolsize: 80
   timeout: 1
-
 
 GENERATOR:
   backend: agentic
   max_review_loops: 1
-  max_bundle_artifacts: 5
-  max_bundle_bytes: 262144
-  checkpoint_path: /tmp/tanner/tanner-agentic-checkpoints.sqlite
+  max_bundle_artifacts: 8
+  max_bundle_bytes: 2000000
+  checkpoint_path: /tmp/tanner-agentic-browser-preview.sqlite
   graph_recursion_limit: 200
-  review_log_path: /tmp/tanner/tanner-agentic-review-log.json
-  enable_live_research: False
+  review_log_path: /tmp/tanner-agentic-review-log.json
+  enable_live_research: True
   max_tool_response_chars: 4000
-  max_command_output_chars: 4000
-  command_timeout: 5
-  meta_policy_enabled: True
-  meta_policy_min_distinct_ips: 2
-  meta_policy_min_recent_hits: 3
-  meta_policy_recent_window_seconds: 86400
-  meta_policy_per_ip_cooldown_seconds: 1800
-  meta_policy_hourly_budget: 10
-  meta_policy_daily_budget: 120
-  meta_policy_max_path_length: 120
-  meta_policy_require_non_ua_positive: True
-  meta_policy_pending_ttl_seconds: 600
+  max_command_output_chars: 2000
+  command_timeout: 2
+  max_concurrent_model_calls: 1
+  inter_call_delay_seconds: 12.5
+  max_rate_limit_retries: 3
+  default_rate_limit_backoff_seconds: 12.0
+  max_length_limit_retries: 3
+  length_retry_token_increase: 800
+  max_length_retry_tokens: 6000
   role_defaults:
     provider: openai
-    model: gpt-4.1-mini
-    temperature: 0.2
-    max_tokens: 900
+    model: gpt-5.4
     timeout: 120
-    max_retries: 2
+    max_retries: 1
   roles:
     expert:
-      temperature: 0.1
-      max_tokens: 900
+      temperature: 0.0
+      max_tokens: 1800
     design:
-      temperature: 0.2
-      max_tokens: 900
+      temperature: 0.0
+      max_tokens: 2800
     coder:
-      temperature: 0.35
-      max_tokens: 1000
+      temperature: 0.1
+      max_tokens: 1600
     review:
-      temperature: 0.05
-      max_tokens: 700
+      temperature: 0.0
+      max_tokens: 1600
 
 EMULATORS:
   root_dir: /opt/tanner
 
-EMULATOR_ENABLED: 
+EMULATOR_ENABLED:
   sqli: False
   rfi: True
-  lfi: True 
+  lfi: True
   xss: True
   cmd_exec: True
-  php_code_injection: True 
+  php_code_injection: True
   php_object_injection: True
   crlf: True
   xxe_injection: True
   template_injection: True
 
-SQLI: 
+SQLI:
   type: SQLITE
   db_name: tanner_db
   host: 127.0.0.1
   user: root
   password: user_pass
 
-XXE_INJECTION: 
+XXE_INJECTION:
   OUT_OF_BAND: False
 
-RFI: 
+RFI:
   allow_insecure: False
 
-DOCKER: 
+DOCKER:
   host_image: busybox:latest
 
-LOGGER: 
+LOGGER:
   log_debug: /opt/tanner/tanner.log
   log_err: /opt/tanner/tanner.err
 
@@ -114,7 +108,7 @@ MONGO:
   enabled: False
   URI: mongodb://localhost
 
-HPFEEDS: 
+HPFEEDS:
   enabled: False
   HOST: localhost
   PORT: 10000
@@ -122,15 +116,15 @@ HPFEEDS:
   SECRET: ''
   CHANNEL: tanner.events
 
-LOCALLOG: 
+LOCALLOG:
   enabled: False
   PATH: /tmp/tanner_report.json
 
-CLEANLOG: 
+CLEANLOG:
   enabled: False
 
-REMOTE_DOCKERFILE: 
+REMOTE_DOCKERFILE:
   GITHUB: "https://raw.githubusercontent.com/mushorg/tanner/master/docker/tanner/template_injection/Dockerfile"
 
-SESSIONS: 
+SESSIONS:
   delete_timeout: 300

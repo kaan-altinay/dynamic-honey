@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import base64
 import asyncio
+from datetime import datetime, timezone
+import fcntl
 import json
 import logging
 import operator
+from pathlib import Path
 import re
 import uuid
 from typing import Annotated, TypedDict
@@ -84,6 +87,7 @@ class AgenticBundleGenerator(BaseGenerator):
     def __init__(self, runtime_config: GeneratorRuntimeConfig | None = None):
         self.logger = logging.getLogger(__name__)
         self.runtime_config = runtime_config or load_runtime_config()
+        self._review_log_path = Path(self.runtime_config.review_log_path)
         self._role_models = {}
         self._invoke_semaphore = asyncio.Semaphore(self.runtime_config.max_concurrent_model_calls)
         self._invoke_spacing_lock = asyncio.Lock()
@@ -216,7 +220,18 @@ class AgenticBundleGenerator(BaseGenerator):
             )
             if model is None:
                 raise RuntimeError("{} model is unavailable".format(role_name))
-            runnable = model.with_structured_output(schema)
+            # OpenAI strict response_format rejects free-form object schemas used by
+            # StructuredJsonDocumentDraft (content_model.document as arbitrary JSON).
+            # Use function-calling for this specific schema to preserve compatibility
+            # without changing stricter structured-output behavior for other schemas.
+            structured_output_method = None
+            if role_name == "coder" and getattr(schema, "__name__", "") == "StructuredJsonDocumentDraft":
+                structured_output_method = "function_calling"
+
+            if structured_output_method is None:
+                runnable = model.with_structured_output(schema)
+            else:
+                runnable = model.with_structured_output(schema, method=structured_output_method)
 
             try:
                 async with self._invoke_semaphore:
@@ -322,6 +337,14 @@ class AgenticBundleGenerator(BaseGenerator):
                 )
             )
 
+        contract_headers = self._header_hints_to_dicts(artifact.response_contract.headers_hint)
+        structured_headers = self._header_hints_to_dicts(structured_draft.headers_hint)
+        headers_hint = contract_headers + [
+            header
+            for header in structured_headers
+            if header not in contract_headers
+        ]
+
         return ArtifactDraft(
             artifact_id=artifact.artifact_id,
             path=artifact.path,
@@ -330,7 +353,9 @@ class AgenticBundleGenerator(BaseGenerator):
                 artifact.kind,
                 structured_draft.content_model,
             ),
-            headers_hint=self._header_hints_to_dicts(structured_draft.headers_hint),
+            status_code=artifact.response_contract.status_code,
+            content_type=artifact.response_contract.content_type or structured_draft.content_type,
+            headers_hint=headers_hint,
             review_notes=review_notes,
             plan_revision=plan_revision,
         )
@@ -465,6 +490,70 @@ class AgenticBundleGenerator(BaseGenerator):
             reasons=structured_decision.reasons or [],
             required_fixes=structured_decision.required_fixes or [],
         )
+
+    @staticmethod
+    def _serialize_reviewer_output(review_output):
+        if hasattr(review_output, "model_dump"):
+            try:
+                review_output = review_output.model_dump(mode="json", exclude_none=False)
+            except Exception:
+                try:
+                    review_output = review_output.model_dump()
+                except Exception:
+                    review_output = str(review_output)
+        try:
+            json.dumps(review_output)
+            return review_output
+        except TypeError:
+            return str(review_output)
+
+    def _append_review_log(
+        self,
+        endpoint: str,
+        review_output,
+        decision: ReviewDecision,
+        source: str,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc)
+        entry = {
+            "date": timestamp.date().isoformat(),
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "source": source,
+            "review_output": self._serialize_reviewer_output(review_output),
+            "decision": decision.model_dump(mode="json"),
+        }
+
+        try:
+            self._review_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._review_log_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.seek(0)
+                    raw_payload = handle.read().strip()
+                    payload = json.loads(raw_payload) if raw_payload else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+
+                    history = payload.get(endpoint)
+                    if not isinstance(history, list):
+                        history = []
+                    history.append(entry)
+                    payload[endpoint] = history
+
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(json.dumps(payload, indent=2, sort_keys=True))
+                    handle.write("\n")
+                    handle.flush()
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception as error:
+            self.logger.warning(
+                "Unable to append review log at %s for %s: %s",
+                self._review_log_path,
+                endpoint,
+                error,
+            )
 
     @staticmethod
     def _reference_query_for_intent(expert_spec: ExpertSpec, request: GenerationRequest) -> str:
@@ -673,10 +762,12 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- Up to {max_artifacts} total outputs (generated artifacts + fetched assets)\n"
                     "- Choose exactly one representation per local path: generated artifact OR fetched asset, never both\n"
                     "- Generated artifacts must use supported kinds only: html_page, config_text, json_document, plain_text, binary_asset, stylesheet, javascript, robots_txt, sitemap_xml, xml_document, credential_bait, log_excerpt, backup_manifest\n"
-                    "- Never use artifact.kind='asset_file' in artifacts; use artifact.kind='binary_asset' for generated local bytes and reference_asset_plan.asset_fetches for copied remote assets\n\n"
+                    "- Never use artifact.kind='asset_file' in artifacts; use artifact.kind='binary_asset' for generated local bytes and reference_asset_plan.asset_fetches for copied remote assets\n"
+                    "- Root path rule: if any artifact path is '/' then it MUST be kind='html_page' with HTML contract (text/html). Never plan '/' as json_document/xml_document/plain_text/config_text/binary_asset. For API support artifacts use explicit non-root paths such as /_up, /_session, /version, /info\n\n"
                     "Field guidance:\n"
                     "- artifact.purpose: This is the primary instruction sent to the Coder. Write it as a concrete content specification (e.g., 'WordPress login page with username and password form, linking to the theme stylesheet')\n"
                     "- artifact.links_to: List every artifact/asset path this artifact should reference in its rendered output (e.g., a page should list its stylesheet, script, and nav link targets)\n"
+                    "- artifact.response_contract: Define per-artifact HTTP contract with status_code, content_type, and optional headers_hint (name/value pairs)\n"
                     "- reference_asset_plan.asset_fetches: Remote assets you want copied locally for realism. Use this when you need a file derived from a real external source URL\n"
                     "- reference_asset_plan.reference_urls: List the selected reference pages used to justify the design\n\n"
                     "Always use default values for: render_strategy='deterministic', artifact_scope='static_file', must_exist=true, dynamic_candidate=false, service_candidate=false"
@@ -976,6 +1067,49 @@ class AgenticBundleGenerator(BaseGenerator):
             )
         return sends
 
+    _PLACEHOLDER_TOKEN_RE = re.compile(r"\b(example|sample)\b", re.IGNORECASE)
+
+    @staticmethod
+    def _replace_placeholder_tokens(value: str) -> tuple[str, int]:
+        def _replacement(match: re.Match[str]) -> str:
+            token = match.group(0)
+            if token.isupper():
+                return "PRODUCTION"
+            if token[:1].isupper():
+                return "Production"
+            return "production"
+
+        sanitized_value, replacements = AgenticBundleGenerator._PLACEHOLDER_TOKEN_RE.subn(_replacement, value)
+        return sanitized_value, replacements
+
+    @staticmethod
+    def _scrub_placeholder_content(value, *, parent_key: str | None = None):
+        path_like_keys = {"path", "href", "src", "action", "local_path", "source_url"}
+        if isinstance(value, dict):
+            total = 0
+            sanitized = {}
+            for key, item in value.items():
+                key_name = key if isinstance(key, str) else None
+                sanitized_item, count = AgenticBundleGenerator._scrub_placeholder_content(item, parent_key=key_name)
+                sanitized[key] = sanitized_item
+                total += count
+            return sanitized, total
+        if isinstance(value, list):
+            total = 0
+            sanitized = []
+            for item in value:
+                sanitized_item, count = AgenticBundleGenerator._scrub_placeholder_content(item, parent_key=parent_key)
+                sanitized.append(sanitized_item)
+                total += count
+            return sanitized, total
+        if isinstance(value, str):
+            stripped = value.strip()
+            if parent_key in path_like_keys or stripped.startswith("/") or "://" in stripped:
+                return value, 0
+            return AgenticBundleGenerator._replace_placeholder_tokens(value)
+        return value, 0
+
+
     @staticmethod
     def _sanitize_artifact_draft(
         draft: ArtifactDraft,
@@ -1048,11 +1182,21 @@ class AgenticBundleGenerator(BaseGenerator):
                     model["form"] = {**form, "action": draft.path}
                     notes.append("sanitized form.action -> {}".format(draft.path))
 
+        model, placeholder_replacements = AgenticBundleGenerator._scrub_placeholder_content(model)
+        if placeholder_replacements > 0:
+            notes.append(
+                "sanitized placeholder text: replaced {} example/sample token(s)".format(
+                    placeholder_replacements
+                )
+            )
+
         return ArtifactDraft(
             artifact_id=draft.artifact_id,
             path=draft.path,
             kind=draft.kind,
             content_model=model,
+            status_code=draft.status_code,
+            content_type=draft.content_type,
             headers_hint=draft.headers_hint,
             review_notes=notes,
             plan_revision=draft.plan_revision,
@@ -1153,7 +1297,8 @@ class AgenticBundleGenerator(BaseGenerator):
                 "content": (
                     "You are a Coder role generating one static artifact draft for a honeypot bundle.\n\n"
                     "CRITICAL SAFETY RULE:\n"
-                    "Never use internal planning words such as fake, lure, attacker, attackers, honeypot, decoy, or trap in any served text, comments, titles, footers, or file content. The output must read as authentic production content.\n\n"
+                    "Never use internal planning words such as fake, lure, attacker, attackers, honeypot, decoy, or trap in any served text, comments, titles, footers, or file content. "
+                    "Never include the words 'example' or 'sample' in served content. The output must read as authentic production content.\n\n"
                     "General instructions:\n"
                     "- Return only the typed structured draft for the requested artifact kind\n"
                     "- artifact_id and path: echo the exact values from the user message\n"
@@ -1167,7 +1312,10 @@ class AgenticBundleGenerator(BaseGenerator):
                     "artifact_id: {artifact_id} (echo this exactly)\n"
                     "path: {artifact_path} (echo this exactly)\n"
                     "kind: {kind}\n"
-                    "purpose: {purpose}\n\n"
+                    "purpose: {purpose}\n"
+                    "response_status_code: {response_status_code} (must match exactly)\n"
+                    "response_content_type: {response_content_type} (must match exactly unless omitted)\n"
+                    "response_headers_hint: {response_headers_hint}\n\n"
                     "Environment theme: {theme}\n"
                     "Reference pages: {reference_urls}\n"
                     "Reference notes: {reference_notes}\n\n"
@@ -1210,6 +1358,15 @@ class AgenticBundleGenerator(BaseGenerator):
                     artifact_path=artifact.path,
                     kind=artifact.kind,
                     purpose=artifact.purpose,
+                    response_status_code=artifact.response_contract.status_code,
+                    response_content_type=artifact.response_contract.content_type
+                    or self._default_content_type_for_artifact(artifact.kind, artifact.path),
+                    response_headers_hint=", ".join(
+                        "{}={}".format(header_hint.name, header_hint.value)
+                        for header_hint in artifact.response_contract.headers_hint
+                    )
+                    if artifact.response_contract.headers_hint
+                    else "none",
                     theme=expert_spec.environment_theme,
                     reference_urls=", ".join(reference_urls) if reference_urls else "none",
                     reference_notes=" | ".join(reference_notes) if reference_notes else "none",
@@ -1225,6 +1382,14 @@ class AgenticBundleGenerator(BaseGenerator):
             structured_draft = await self._invoke_structured("coder", draft_schema, messages)
             structured_draft = draft_schema.model_validate(structured_draft)
             draft = self._materialize_structured_draft(structured_draft, artifact, plan_revision)
+            draft = self._sanitize_artifact_draft(
+                draft,
+                request,
+                allowed_local_asset_paths=allowed_local_asset_paths,
+                allowed_internal_paths=allowed_internal_paths,
+                primary_path=primary_path,
+                forbidden_external_assets=forbidden_external_assets,
+            )
             validate_artifact_draft(draft, request)
             try:
                 validate_artifact_draft_contract(
@@ -1256,7 +1421,14 @@ class AgenticBundleGenerator(BaseGenerator):
                 )
         except Exception as error:
             self.logger.info("Falling back to heuristic draft for %s: %s", artifact.path, error)
-            draft = heuristic_draft
+            draft = self._sanitize_artifact_draft(
+                heuristic_draft,
+                request,
+                allowed_local_asset_paths=allowed_local_asset_paths,
+                allowed_internal_paths=allowed_internal_paths,
+                primary_path=primary_path,
+                forbidden_external_assets=forbidden_external_assets,
+            )
             validate_artifact_draft(draft, request)
             validate_artifact_draft_contract(
                 draft,
@@ -1367,13 +1539,24 @@ class AgenticBundleGenerator(BaseGenerator):
             },
         ]
 
+        reviewer_output = None
+        review_source = "model"
         try:
-            structured_decision = await self._invoke_structured("review", StructuredReviewDecision, messages)
-            structured_decision = StructuredReviewDecision.model_validate(structured_decision)
+            reviewer_output = await self._invoke_structured("review", StructuredReviewDecision, messages)
+            structured_decision = StructuredReviewDecision.model_validate(reviewer_output)
             decision = self._normalize_review_decision(structured_decision)
         except Exception as error:
             self.logger.info("Falling back to deterministic review for %s: %s", request.normalized_path, error)
+            review_source = "deterministic"
             decision = ReviewDecision(decision="approve", reasons=["deterministic validation passed"], required_fixes=[])
+            reviewer_output = decision.model_dump(mode="json")
+
+        self._append_review_log(
+            request.normalized_path,
+            reviewer_output,
+            decision,
+            source=review_source,
+        )
 
         # Let the LLM review verdict stand - it has veto power over quality defects
         if decision.decision != "approve":
@@ -1383,18 +1566,32 @@ class AgenticBundleGenerator(BaseGenerator):
                 decision.decision,
                 decision.reasons or decision.required_fixes,
             )
-        
+
         trace_decision = decision.decision if decision.decision == "approve" else "quality_defect:{}".format(decision.decision)
         return {"review_decision": decision, "trace_notes": ["review:{}".format(trace_decision)]}
 
     def _review_revise_or_fallback(self, state: GraphState, reasons: list[str]):
         next_iteration = state.get("review_iteration", 0) + 1
         if next_iteration >= self.runtime_config.max_review_loops:
-            decision = ReviewDecision(decision="fallback", reasons=reasons, required_fixes=reasons)
-            route = "fallback"
+            retain_reason = (
+                "review loop budget exhausted after {} iteration(s); retaining latest generated artifacts".format(
+                    next_iteration
+                )
+            )
+            decision = ReviewDecision(decision="approve", reasons=[retain_reason] + reasons, required_fixes=[])
+            route = "approve"
         else:
             decision = ReviewDecision(decision="revise", reasons=reasons, required_fixes=reasons)
             route = "revise"
+
+        request = state.get("request")
+        endpoint = request.normalized_path if isinstance(request, GenerationRequest) else "<unknown>"
+        self._append_review_log(
+            endpoint,
+            decision.model_dump(mode="json"),
+            decision,
+            source="review_loop",
+        )
         return {
             "review_decision": decision,
             "review_iteration": next_iteration,
@@ -1483,6 +1680,25 @@ class AgenticBundleGenerator(BaseGenerator):
             return "font/ttf"
         if lowered.endswith(".otf"):
             return "font/otf"
+        return "application/octet-stream"
+
+    def _default_content_type_for_artifact(self, kind: str, path: str) -> str:
+        if kind == "html_page":
+            return "text/html; charset=utf-8"
+        if kind == "config_text":
+            return "text/plain; charset=utf-8"
+        if kind == "json_document":
+            return "application/json; charset=utf-8"
+        if kind in {"plain_text", "robots_txt", "credential_bait", "log_excerpt", "backup_manifest"}:
+            return "text/plain; charset=utf-8"
+        if kind == "binary_asset":
+            return self._binary_asset_content_type_for_path(path)
+        if kind == "stylesheet":
+            return "text/css; charset=utf-8"
+        if kind == "javascript":
+            return "application/javascript; charset=utf-8"
+        if kind in {"sitemap_xml", "xml_document"}:
+            return "application/xml; charset=utf-8"
         return "application/octet-stream"
 
     @staticmethod
@@ -1781,6 +1997,12 @@ class AgenticBundleGenerator(BaseGenerator):
                 ),
             ]
 
+        for artifact in artifacts:
+            if artifact.response_contract.content_type is None:
+                artifact.response_contract.content_type = self._default_content_type_for_artifact(
+                    artifact.kind,
+                    artifact.path,
+                )
         if any("robots" in feedback for feedback in review_feedback) and not any(a.path == "/robots.txt" for a in artifacts):
             artifacts.append(
                 PlannedArtifact(
@@ -1928,12 +2150,16 @@ class AgenticBundleGenerator(BaseGenerator):
         else:
             content_model = {"lines": [artifact.purpose]}
 
+        contract_headers = self._header_hints_to_dicts(artifact.response_contract.headers_hint)
         draft = ArtifactDraft(
             artifact_id=artifact.artifact_id,
             path=artifact.path,
             kind=artifact.kind,
             content_model=content_model,
-            headers_hint=[{"X-Tanner-Generated": "agentic"}],
+            status_code=artifact.response_contract.status_code,
+            content_type=artifact.response_contract.content_type
+            or self._default_content_type_for_artifact(artifact.kind, artifact.path),
+            headers_hint=contract_headers + [{"X-Tanner-Generated": "agentic"}],
             review_notes=[artifact.purpose],
             plan_revision=plan_revision,
         )
@@ -2111,7 +2337,13 @@ class AgenticBundleGenerator(BaseGenerator):
                 if not hasattr(checkpointer.conn, "is_alive"):
                     checkpointer.conn.is_alive = lambda: True
                 graph = self._graph_builder.compile(checkpointer=checkpointer)
-                result = await graph.ainvoke(initial_state, config={"configurable": {"thread_id": thread_id}})
+                result = await graph.ainvoke(
+                    initial_state,
+                    config={
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": self.runtime_config.graph_recursion_limit,
+                    }
+                )
             bundle = GeneratedBundle.model_validate(result["generated_bundle"])
             validate_bundle(bundle, request, self.runtime_config)
             return bundle

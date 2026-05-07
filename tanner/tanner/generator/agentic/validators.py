@@ -117,6 +117,107 @@ def _required_primary_kind_for_path(path: str) -> str | None:
         return "binary_asset"
     return None
 
+def _binary_content_type_for_path(path: str) -> str | None:
+    lowered = path.lower()
+    if lowered.endswith(".ico"):
+        return "image/x-icon"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".bmp"):
+        return "image/bmp"
+    if lowered.endswith(".svg"):
+        return "image/svg+xml"
+    if lowered.endswith(".woff"):
+        return "font/woff"
+    if lowered.endswith(".woff2"):
+        return "font/woff2"
+    if lowered.endswith(".ttf"):
+        return "font/ttf"
+    if lowered.endswith(".otf"):
+        return "font/otf"
+    return None
+
+
+def _normalize_content_type(content_type: str | None) -> str | None:
+    if not isinstance(content_type, str) or not content_type.strip():
+        return None
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _content_type_matches(actual: str | None, expected: str | None) -> bool:
+    normalized_actual = _normalize_content_type(actual)
+    normalized_expected = _normalize_content_type(expected)
+    if normalized_expected is None:
+        return True
+    if normalized_actual == normalized_expected:
+        return True
+    # Allow SOAP/XML media types on endpoints that otherwise accept XML.
+    if normalized_expected == "application/xml" and normalized_actual in {"application/soap+xml", "text/xml"}:
+        return True
+    return False
+
+
+def _expected_content_type_for_kind_and_path(kind: str, path: str) -> str | None:
+    lowered = path.lower()
+    extension_expected = None
+    if lowered == "/robots.txt" or lowered.endswith(".txt"):
+        extension_expected = "text/plain"
+    elif lowered == "/sitemap.xml" or lowered.endswith(".xml"):
+        extension_expected = "application/xml"
+    elif lowered.endswith(".json"):
+        extension_expected = "application/json"
+    elif lowered.endswith(".css"):
+        extension_expected = "text/css"
+    elif lowered.endswith(".js"):
+        extension_expected = "application/javascript"
+    elif lowered.endswith((".html", ".htm", ".php", ".asp", ".jsp")):
+        extension_expected = "text/html"
+    elif lowered.endswith(_BINARY_ASSET_EXTENSIONS):
+        extension_expected = _binary_content_type_for_path(path)
+
+    kind_expected_map = {
+        "html_page": "text/html",
+        "config_text": "text/plain",
+        "json_document": "application/json",
+        "plain_text": "text/plain",
+        "stylesheet": "text/css",
+        "javascript": "application/javascript",
+        "robots_txt": "text/plain",
+        "sitemap_xml": "application/xml",
+        "xml_document": "application/xml",
+        "credential_bait": "text/plain",
+        "log_excerpt": "text/plain",
+        "backup_manifest": "text/plain",
+        "binary_asset": _binary_content_type_for_path(path),
+    }
+    kind_expected = kind_expected_map.get(kind)
+    return extension_expected or kind_expected
+
+
+def _extract_content_type_from_dict_headers(headers: list[dict[str, str]]) -> str | None:
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        for key, value in header.items():
+            if isinstance(key, str) and key.lower() == "content-type" and isinstance(value, str):
+                return value
+    return None
+
+
+def _extract_content_type_from_header_hints(header_hints) -> str | None:
+    for header_hint in header_hints:
+        name = getattr(header_hint, "name", None)
+        value = getattr(header_hint, "value", None)
+        if isinstance(name, str) and name.lower() == "content-type" and isinstance(value, str):
+            return value
+    return None
+
 
 def _planned_output_count(plan: ResourcePlan) -> int:
     return len(plan.artifacts) + len(plan.reference_asset_plan.asset_fetches)
@@ -319,6 +420,26 @@ def validate_planned_artifact(artifact: PlannedArtifact, request: GenerationRequ
     if normalize_path(artifact.path, index_page=request.index_page) != artifact.path:
         raise ValidationError("artifact path is not normalized: {}".format(artifact.path))
 
+    expected_content_type = _expected_content_type_for_kind_and_path(artifact.kind, artifact.path)
+    contract_content_type = artifact.response_contract.content_type
+    if contract_content_type is not None and not _content_type_matches(contract_content_type, expected_content_type):
+        raise ValidationError(
+            "planned artifact {} has response_contract.content_type {} incompatible with expected {}".format(
+                artifact.path,
+                contract_content_type,
+                expected_content_type,
+            )
+        )
+
+    hinted_content_type = _extract_content_type_from_header_hints(artifact.response_contract.headers_hint)
+    if hinted_content_type is not None and not _content_type_matches(hinted_content_type, contract_content_type or expected_content_type):
+        raise ValidationError(
+            "planned artifact {} response_contract.headers_hint Content-Type {} conflicts with expected {}".format(
+                artifact.path,
+                hinted_content_type,
+                contract_content_type or expected_content_type,
+            )
+        )
 
 def validate_planned_asset_fetch(asset_fetch: PlannedAssetFetch, request: GenerationRequest) -> None:
     if normalize_path(asset_fetch.local_path, index_page=request.index_page) != asset_fetch.local_path:
@@ -368,6 +489,26 @@ def validate_artifact_draft(draft: ArtifactDraft, request: GenerationRequest) ->
         if not decoded:
             raise ValidationError("binary_asset draft base64 payload decodes to empty bytes")
 
+
+    expected_content_type = _expected_content_type_for_kind_and_path(draft.kind, draft.path)
+    if draft.content_type is not None and not _content_type_matches(draft.content_type, expected_content_type):
+        raise ValidationError(
+            "draft {} content_type {} incompatible with expected {}".format(
+                draft.path,
+                draft.content_type,
+                expected_content_type,
+            )
+        )
+
+    hinted_content_type = _extract_content_type_from_dict_headers(draft.headers_hint)
+    if hinted_content_type is not None and not _content_type_matches(hinted_content_type, draft.content_type or expected_content_type):
+        raise ValidationError(
+            "draft {} headers_hint Content-Type {} conflicts with expected {}".format(
+                draft.path,
+                hinted_content_type,
+                draft.content_type or expected_content_type,
+            )
+        )
 def validate_artifact_draft_contract(
     draft: ArtifactDraft,
     request: GenerationRequest,
@@ -485,14 +626,24 @@ def validate_generated_artifact(artifact: GeneratedArtifact, request: Generation
         raise ValidationError("generated artifact path is not normalized: {}".format(artifact.path))
     if artifact.artifact_scope != "static_file":
         raise ValidationError("generated artifact is not static")
-    if artifact.status_code != 200:
-        raise ValidationError("generated artifact status code must be 200 for static v1")
+    if artifact.status_code < 100 or artifact.status_code > 599:
+        raise ValidationError("generated artifact status code is out of range")
     if not artifact.body_bytes:
         raise ValidationError("generated artifact body is empty")
-    if not any(
-        isinstance(header, dict) and any(key.lower() == "content-type" for key in header.keys()) for header in artifact.headers
-    ):
+
+    content_type_header = _extract_content_type_from_dict_headers(artifact.headers)
+    if content_type_header is None:
         raise ValidationError("generated artifact missing content-type header")
+
+    expected_content_type = _expected_content_type_for_kind_and_path(artifact.kind, artifact.path)
+    if not _content_type_matches(content_type_header, expected_content_type):
+        raise ValidationError(
+            "generated artifact {} Content-Type {} is incompatible with expected {}".format(
+                artifact.path,
+                content_type_header,
+                expected_content_type,
+            )
+        )
 
     if artifact.kind != "binary_asset":
         decoded_body = artifact.body_bytes.decode("utf-8", errors="ignore")

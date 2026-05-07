@@ -262,12 +262,15 @@ def render_artifact(draft: ArtifactDraft) -> GeneratedArtifact:
     else:
         raise ValueError("Unsupported artifact kind {}".format(draft.kind))
 
+    if isinstance(draft.content_type, str) and draft.content_type.strip():
+        content_type = draft.content_type
+
     return GeneratedArtifact(
         path=draft.path,
         kind=draft.kind,
         headers=_normalize_headers(draft.headers_hint, content_type),
         body_bytes=body,
-        status_code=200,
+        status_code=draft.status_code,
         source_artifact_id=draft.artifact_id,
         artifact_scope="static_file",
     )

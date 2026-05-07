@@ -79,6 +79,7 @@ class PlannedArtifact(ModelBase):
     path: str
     kind: ArtifactKind
     purpose: str
+    response_contract: ResponseContract = Field(default_factory=lambda: ResponseContract())
     depends_on: list[str] = Field(default_factory=list)
     links_to: list[str] = Field(default_factory=list)
     must_exist: bool = True
@@ -103,6 +104,11 @@ class HeaderHint(ModelBase):
     name: str
     value: str
 
+
+class ResponseContract(ModelBase):
+    status_code: int = Field(default=200, ge=100, le=599)
+    content_type: str | None = None
+    headers_hint: list[HeaderHint] = Field(default_factory=list)
 
 class LinkSpec(ModelBase):
     label: str
@@ -186,6 +192,8 @@ class BinaryAssetContent(ModelBase):
 class StructuredDraftBase(ModelBase):
     artifact_id: str
     path: str
+    status_code: int = Field(default=200, ge=100, le=599)
+    content_type: str | None = None
     headers_hint: list[HeaderHint] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
 
@@ -260,6 +268,8 @@ class ArtifactDraft(ModelBase):
     path: str
     kind: ArtifactKind
     content_model: dict[str, Any] = Field(default_factory=dict)
+    status_code: int = Field(default=200, ge=100, le=599)
+    content_type: str | None = None
     headers_hint: list[dict[str, str]] = Field(default_factory=list)
     review_notes: list[str] = Field(default_factory=list)
     plan_revision: int = Field(default=0, ge=0)
@@ -352,6 +362,8 @@ class GeneratorRuntimeConfig(ModelBase):
     max_bundle_artifacts: int = Field(default=4, ge=1)
     max_bundle_bytes: int = Field(default=262_144, ge=1024)
     checkpoint_path: str = "/tmp/tanner-agentic-checkpoints.sqlite"
+    graph_recursion_limit: int = Field(default=200, ge=25)
+    review_log_path: str = "/tmp/tanner-agentic-review-log.json"
     enable_live_research: bool = True
     max_tool_response_chars: int = Field(default=4_000, ge=256)
     max_command_output_chars: int = Field(default=4_000, ge=256)

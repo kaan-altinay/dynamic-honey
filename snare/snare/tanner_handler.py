@@ -261,6 +261,9 @@ class TannerHandler:
 
         for prepared_artifact in prepared_artifacts:
             content_file = os.path.join(self.dir, prepared_artifact["hash"])
+            # Hash-addressed content is immutable; if already present, reuse it.
+            if os.path.exists(content_file):
+                continue
             with open(content_file, "wb") as generated_content:
                 generated_content.write(prepared_artifact["body_bytes"])
 

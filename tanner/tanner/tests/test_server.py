@@ -93,6 +93,28 @@ class TestServer(AioHTTPTestCase):
         text = await request.text()
         assert "Tanner server" in text
 
+    def test_meta_policy_blocks_ua_only_signal(self):
+        policy = server.MetaGenerationPolicy(mock.Mock())
+        allowed, reason = policy.should_generate(
+            path="/probe",
+            method="GET",
+            src_ip="10.0.0.1",
+            user_agent="CensysInspect/1.1",
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "ua_only_positive")
+
+    def test_meta_policy_allows_high_value_signal(self):
+        policy = server.MetaGenerationPolicy(mock.Mock())
+        allowed, reason = policy.should_generate(
+            path="/api/version",
+            method="GET",
+            src_ip="10.0.0.2",
+            user_agent="",
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "scheduled")
+
     def test_make_response(self):
         msg = "test"
         content = self.serv._make_response(msg)

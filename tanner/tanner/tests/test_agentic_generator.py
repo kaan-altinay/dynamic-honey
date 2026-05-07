@@ -62,6 +62,7 @@ class TestAgenticBundleGenerator(unittest.TestCase):
             "max_bundle_artifacts": 4,
             "max_bundle_bytes": 262_144,
             "checkpoint_path": checkpoint_path,
+            "review_log_path": os.path.join(self.temp_dir.name, "review-log.json"),
             "enable_live_research": False,
             "max_tool_response_chars": 1024,
             "max_command_output_chars": 1024,
@@ -561,6 +562,88 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         self.assertEqual(primary.kind, "binary_asset")
         validate_bundle(bundle, request, runtime_config)
 
+
+    def test_validate_plan_rejects_response_contract_content_type_mismatch(self):
+        request = ensure_generation_request("example.com", "/api/status.json", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=4)
+        plan = ResourcePlan(
+            primary_path="/api/status.json",
+            theme_summary="JSON endpoint surface",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="primary-json",
+                    path="/api/status.json",
+                    kind="json_document",
+                    purpose="Primary JSON endpoint",
+                    response_contract={"status_code": 200, "content_type": "text/html; charset=utf-8"},
+                ),
+                PlannedArtifact(
+                    artifact_id="support-text",
+                    path="/version",
+                    kind="plain_text",
+                    purpose="Support metadata endpoint",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["framework_probe"],
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_plan(plan, request, runtime_config)
+
+    def test_render_artifact_uses_draft_status_code_and_content_type(self):
+        artifact = render_artifact(
+            ArtifactDraft(
+                artifact_id="text-status",
+                path="/status.txt",
+                kind="plain_text",
+                content_model={"lines": ["status: ok"]},
+                status_code=401,
+                content_type="text/plain; charset=utf-8",
+                headers_hint=[{"WWW-Authenticate": "Basic realm=\"Restricted\""}],
+            )
+        )
+
+        self.assertEqual(artifact.status_code, 401)
+        self.assertTrue(
+            any(
+                isinstance(header, dict)
+                and header.get("Content-Type") == "text/plain; charset=utf-8"
+                for header in artifact.headers
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(header, dict)
+                and header.get("WWW-Authenticate") == "Basic realm=\"Restricted\""
+                for header in artifact.headers
+            )
+        )
+
+    def test_validate_bundle_rejects_generated_content_type_mismatch(self):
+        request = ensure_generation_request("example.com", "/api/status.json", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=2)
+        bundle = GeneratedBundle(
+            primary_path="/api/status.json",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/api/status.json",
+                    kind="json_document",
+                    headers=[{"Content-Type": "text/plain; charset=utf-8"}],
+                    body_bytes=b'{"status":"ok"}',
+                    status_code=200,
+                    source_artifact_id="json-status",
+                    artifact_scope="static_file",
+                )
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        with self.assertRaises(ValidationError):
+            validate_bundle(bundle, request, runtime_config)
     def test_validate_bundle_rejects_internal_language_leak(self):
         request = ensure_generation_request("example.com", "/status", {"index_page": "/index.html"})
         runtime_config = self._runtime_config(max_bundle_artifacts=2)
@@ -625,7 +708,7 @@ class TestAgenticBundleGenerator(unittest.TestCase):
 
         self.assertEqual(len(sends), len(resource_plan.artifacts))
 
-    def test_review_loop_uses_fallback_after_max_review_loops(self):
+    def test_review_loop_retains_last_bundle_after_max_review_loops(self):
         generator = AlwaysReviseGenerator(
             runtime_config=self._runtime_config(max_review_loops=2)
         )
@@ -638,6 +721,38 @@ class TestAgenticBundleGenerator(unittest.TestCase):
             )
         )
 
-        self.assertTrue(bundle.used_fallback)
+        self.assertFalse(bundle.used_fallback)
         self.assertEqual(bundle.primary_path, "/admin/login")
         self.assertEqual(generator.review_calls, 2)
+        self.assertIn("review loop budget exhausted", bundle.review_summary)
+
+    def test_review_log_appends_history_per_endpoint(self):
+        runtime_config = self._runtime_config(max_review_loops=1)
+        generator = AlwaysReviseGenerator(runtime_config=runtime_config)
+
+        self.loop.run_until_complete(
+            generator.generate_bundle(
+                host="example.com",
+                path="/admin/login",
+                site_profile={"index_page": "/index.html"},
+            )
+        )
+        self.loop.run_until_complete(
+            generator.generate_bundle(
+                host="example.com",
+                path="/admin/login",
+                site_profile={"index_page": "/index.html"},
+            )
+        )
+
+        review_log_path = runtime_config.review_log_path
+        with open(review_log_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        self.assertIn("/admin/login", payload)
+        history = payload["/admin/login"]
+        self.assertGreaterEqual(len(history), 2)
+        for entry in history:
+            self.assertIn("date", entry)
+            self.assertIn("review_output", entry)
+            self.assertIn("decision", entry)

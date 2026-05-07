@@ -37,6 +37,8 @@ def load_runtime_config() -> GeneratorRuntimeConfig:
         max_bundle_artifacts=int(_config_value("max_bundle_artifacts", 4)),
         max_bundle_bytes=int(_config_value("max_bundle_bytes", 262_144)),
         checkpoint_path=str(_config_value("checkpoint_path", "/tmp/tanner-agentic-checkpoints.sqlite")),
+        graph_recursion_limit=int(_config_value("graph_recursion_limit", 200)),
+        review_log_path=str(_config_value("review_log_path", "/tmp/tanner-agentic-review-log.json")),
         enable_live_research=bool(_config_value("enable_live_research", True)),
         max_tool_response_chars=int(_config_value("max_tool_response_chars", 4_000)),
         max_command_output_chars=int(_config_value("max_command_output_chars", 4_000)),
