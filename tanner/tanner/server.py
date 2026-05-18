@@ -21,6 +21,7 @@ from tanner.reporting.log_local import Reporting as local_report
 from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
 from tanner import __version__ as tanner_version
+from tanner.flow import FlowEvaluator
 
 
 class MetaGenerationPolicy:
@@ -184,6 +185,8 @@ class TannerServer:
         self.logger = logging.getLogger(__name__)
         self.redis_client = None
         self.generator = self._build_generator()
+        self.flows_enabled = self._is_flows_enabled()
+        self.flow_evaluator = FlowEvaluator() if self.flows_enabled else None
         self.meta_generation_policy = MetaGenerationPolicy(self.logger)
 
         if TannerConfig.get("HPFEEDS", "enabled") is True:
@@ -203,6 +206,22 @@ class TannerServer:
             self.logger.info("Using AgenticBundleGenerator backend")
             return AgenticBundleGenerator()
         return base_generator.BaseGenerator()
+
+    def _is_flows_enabled(self):
+        if not isinstance(self.generator, AgenticBundleGenerator):
+            return False
+        try:
+            raw_value = TannerConfig.get("GENERATOR", "enable_scripted_flows")
+        except KeyError:
+            return False
+
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return raw_value != 0
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
 
     @staticmethod
     def _make_response(msg):
@@ -252,6 +271,22 @@ class TannerServer:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _build_flow_detection(flow_result) -> dict:
+        """Build a type-4 Tanner detection payload from a FlowMatchResult."""
+        payload: dict = {"status_code": flow_result.status_code}
+        if flow_result.redirect_to:
+            payload["redirect_to"] = flow_result.redirect_to
+        if flow_result.artifact_path:
+            payload["rewritten_path"] = flow_result.artifact_path
+        if flow_result.set_cookie:
+            payload["set_cookie"] = flow_result.set_cookie
+        if flow_result.clear_cookie:
+            payload["clear_cookie"] = flow_result.clear_cookie
+        if flow_result.headers:
+            payload["headers"] = flow_result.headers
+        return {"type": 4, "payload": payload}
+
     async def _save_meta_job(self, job_id, fields):
         if self.redis_client is None:
             return
@@ -276,8 +311,23 @@ class TannerServer:
                 raise NotImplementedError("Meta generation is not implemented for the current generator")
 
             bundle = GeneratedBundle.model_validate(generation_result)
+            allow_fallback = bool(
+                getattr(getattr(self.generator, "runtime_config", None), "allow_fallback_persistence", False)
+            )
+            if bundle.used_fallback and not allow_fallback:
+                raise ValueError("generated bundle used fallback; persistence is disabled")
+
             artifacts = [self._serialize_generated_artifact(artifact) for artifact in bundle.artifacts]
 
+            if self.flows_enabled and self.flow_evaluator is not None and getattr(bundle, "flow_descriptor", None) is not None:
+                try:
+                    self.flow_evaluator.register(bundle.primary_path, bundle.flow_descriptor)
+                except Exception as flow_error:
+                    self.logger.warning(
+                        "Failed to register generated flow descriptor for %s: %s",
+                        bundle.primary_path,
+                        flow_error,
+                    )
             await self._save_meta_job(
                 job_id,
                 {
@@ -310,6 +360,23 @@ class TannerServer:
         else:
             session, _ = await self.session_manager.add_or_update_session(data, self.redis_client)
             self.logger.info("Requested path %s", path)
+
+            # V2: evaluate flow rules before normal detection
+            if self.flows_enabled and self.flow_evaluator is not None:
+                bare_path = path.split("?")[0] if "?" in path else path
+                flow_result = self.flow_evaluator.evaluate(session, bare_path, data)
+                if flow_result.matched:
+                    detection = self._build_flow_detection(flow_result)
+                    response_message = dict(detection=detection, sess_uuid=session.get_uuid())
+                    response_msg = self._make_response(msg=response_message)
+                    self.logger.info("Flow matched for %s -> type-4 detection", path)
+                    session_data = data
+                    session_data["response_msg"] = response_msg
+                    if TannerConfig.get("LOCALLOG", "enabled") is True:
+                        lr = local_report()
+                        lr.create_session(session_data)
+                    return web.json_response(response_msg)
+
             await self.dorks.extract_path(path, self.redis_client)
             detection = await self.base_handler.handle(data, session)
             session.set_attack_type(path, detection["name"])

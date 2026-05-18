@@ -56,11 +56,16 @@ def _build_profile_drafts(request: GenerationRequest, profile_name: str) -> list
     profile = FALLBACK_PROFILES[profile_name]
     variables = _resolve_profile_variables(request, profile)
     drafts = []
+    seen_paths = set()
     for blueprint in profile.artifacts:
+        resolved_path = _substitute_templates(blueprint.path, variables)
+        if resolved_path in seen_paths:
+            continue
+        seen_paths.add(resolved_path)
         drafts.append(
             ArtifactDraft(
                 artifact_id=blueprint.artifact_id,
-                path=_substitute_templates(blueprint.path, variables),
+                path=resolved_path,
                 kind=blueprint.kind,
                 content_model=_substitute_templates(blueprint.content_model, variables),
                 review_notes=list(blueprint.review_notes) or ["fallback profile {}".format(profile_name)],

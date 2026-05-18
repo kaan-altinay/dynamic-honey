@@ -14,6 +14,10 @@ from bs4 import BeautifulSoup
 from snare.html_handler import HtmlHandler
 
 
+META_JOB_POLL_INTERVAL_SECONDS = 1.0
+META_JOB_MAX_ATTEMPTS = 600
+
+
 class TannerHandler:
     def __init__(self, run_args, meta, snare_uuid):
         self.run_args = run_args
@@ -283,7 +287,13 @@ class TannerHandler:
             self.meta.clear()
             self.meta.update(updated_meta)
 
-    async def poll_meta_job(self, meta_job_id, requested_path, poll_interval=1.0, max_attempts=30):
+    async def poll_meta_job(
+        self,
+        meta_job_id,
+        requested_path,
+        poll_interval=META_JOB_POLL_INTERVAL_SECONDS,
+        max_attempts=META_JOB_MAX_ATTEMPTS,
+    ):
         endpoint = "http://{0}:8090/meta_job/{1}".format(self.run_args.tanner, meta_job_id)
         async with aiohttp.ClientSession() as session:
             for _ in range(max_attempts):
@@ -319,6 +329,9 @@ class TannerHandler:
                         )
                     except ValueError as error:
                         self.logger.warning("Meta job %s returned invalid bundle: %s", meta_job_id, error)
+                        return False
+                    except OSError as error:
+                        self.logger.warning("Meta job %s could not be persisted: %s", meta_job_id, error)
                         return False
 
                     self.logger.info(
@@ -418,8 +431,53 @@ class TannerHandler:
                 # overwrite local headers with the tanner-provided ones
                 headers.update(payload_content["headers"])
 
-        else:  # type 3
+        elif detection["type"] == 3:
             payload_content = detection["payload"]
             status_code = payload_content["status_code"]
+        elif detection["type"] == 4:
+            # V2 scripted-flow response
+            payload_content = detection["payload"]
+            status_code = payload_content.get("status_code", 200)
+
+            # Extra headers
+            for key, value in payload_content.get("headers", {}).items():
+                headers.add(key, value)
+
+            # Set cookies
+            for name, val in payload_content.get("set_cookie", {}).items():
+                headers.add("Set-Cookie", "{}={}; Path=/; HttpOnly".format(name, val))
+
+            # Clear cookies
+            for name in payload_content.get("clear_cookie", []):
+                headers.add("Set-Cookie", "{}=; Path=/; Max-Age=0; HttpOnly".format(name))
+
+            redirect_to = payload_content.get("redirect_to")
+            rewritten_path = payload_content.get("rewritten_path")
+
+            if redirect_to:
+                headers.add("Location", redirect_to)
+            elif rewritten_path:
+                file_name = None
+                try:
+                    file_name = self.meta[rewritten_path]["hash"]
+                    for header in self.meta[rewritten_path].get("headers", []):
+                        for key, value in header.items():
+                            headers.add(key, value)
+                    content_type = self.meta[rewritten_path].get("content_type")
+                    if content_type:
+                        headers["Content-Type"] = content_type
+                except KeyError:
+                    pass
+                if file_name:
+                    path = os.path.join(self.dir, file_name)
+                    if os.path.isfile(path):
+                        with open(path, "rb") as fh:
+                            content = fh.read()
+                        if headers.get("Content-Type", "").startswith("text/html"):
+                            content = await self.html_handler.handle_content(content)
+                    else:
+                        status_code = 404
+                else:
+                    status_code = 404
 
         return content, headers, status_code

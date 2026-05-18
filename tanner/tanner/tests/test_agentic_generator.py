@@ -9,6 +9,10 @@ from tanner.generator.agentic.models import (
     ArtifactDraft,
     GeneratedArtifact,
     GeneratedBundle,
+    FlowCondition,
+    FlowDescriptor,
+    FlowResponse,
+    FlowRule,
     GeneratorRoleConfig,
     GeneratorRuntimeConfig,
     HeaderHint,
@@ -26,6 +30,7 @@ from tanner.generator.agentic.validators import (
     validate_plan,
  )
 from tanner.generator.agentic.workflow import AgenticBundleGenerator
+from tanner.flow.flow_evaluator import FlowEvaluator
 
 
 class NoModelGenerator(AgenticBundleGenerator):
@@ -756,3 +761,439 @@ class TestAgenticBundleGenerator(unittest.TestCase):
             self.assertIn("date", entry)
             self.assertIn("review_output", entry)
             self.assertIn("decision", entry)
+
+    def test_php_credential_bait_allows_text_plain_contract(self):
+        request = ensure_generation_request("example.com", "/admin/config.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=3)
+        plan = ResourcePlan(
+            primary_path="/admin/config.php",
+            theme_summary="Exposed PHP configuration source",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="admin-config",
+                    path="/admin/config.php",
+                    kind="credential_bait",
+                    purpose="PHP configuration source leak",
+                    response_contract={"status_code": 200, "content_type": "text/plain; charset=utf-8"},
+                ),
+                PlannedArtifact(
+                    artifact_id="admin-log",
+                    path="/admin/error.log",
+                    kind="log_excerpt",
+                    purpose="Supporting PHP error log",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["credential_bait"],
+        )
+
+        validate_plan(plan, request, runtime_config)
+
+    def test_vendor_json_content_type_matches_json_contracts(self):
+        request = ensure_generation_request("example.com", "/actuator/gateway/routes", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=2)
+        plan = ResourcePlan(
+            primary_path="/actuator/gateway/routes",
+            theme_summary="Spring Boot actuator API",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="routes",
+                    path="/actuator/gateway/routes",
+                    kind="json_document",
+                    purpose="Gateway routes actuator payload",
+                    response_contract={
+                        "status_code": 200,
+                        "content_type": "application/vnd.spring-boot.actuator.v3+json",
+                    },
+                ),
+                PlannedArtifact(
+                    artifact_id="health",
+                    path="/actuator/health",
+                    kind="json_document",
+                    purpose="Health actuator payload",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["framework_probe"],
+        )
+        bundle = GeneratedBundle(
+            primary_path="/actuator/gateway/routes",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/actuator/gateway/routes",
+                    kind="json_document",
+                    headers=[{"Content-Type": "application/vnd.spring-boot.actuator.v3+json"}],
+                    body_bytes=b'{"routes":[]}',
+                    status_code=200,
+                    source_artifact_id="routes",
+                    artifact_scope="static_file",
+                )
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        validate_plan(plan, request, runtime_config)
+        validate_bundle(bundle, request, runtime_config)
+
+    def test_design_validation_loop_budget_is_independent_from_review_loop_budget(self):
+        generator = NoModelGenerator(
+            runtime_config=self._runtime_config(max_review_loops=1, max_design_validation_loops=2)
+        )
+
+        first = generator._design_revise_or_fallback({}, ["invalid dynamic scope"])
+        second = generator._design_revise_or_fallback(
+            {"design_validation_iteration": first["design_validation_iteration"]},
+            ["still invalid"],
+        )
+
+        self.assertEqual(first["design_validation_decision"], "revise")
+        self.assertEqual(second["design_validation_decision"], "fallback")
+
+    def test_runtime_config_disallows_fallback_persistence_by_default(self):
+        runtime_config = self._runtime_config()
+
+        self.assertFalse(runtime_config.allow_fallback_persistence)
+
+
+    def test_form_handler_flow_rejects_redirect_only_without_post_failure_artifact(self):
+        request = ensure_generation_request(
+            "example.com",
+            "/boaform/admin/formLogin",
+            {"index_page": "/index.html"},
+        )
+        runtime_config = self._runtime_config(enable_scripted_flows=True, max_bundle_artifacts=4)
+        bundle = GeneratedBundle(
+            primary_path="/boaform/admin/formLogin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=(
+                        b'<html><body><form method="post" action="/boaform/admin/formLogin">'
+                        b'<input name="username"><input name="password" type="password">'
+                        b'</form></body></html>'
+                    ),
+                    status_code=200,
+                    source_artifact_id="handler",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/admin/login.asp",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>Login</body></html>',
+                    status_code=200,
+                    source_artifact_id="login",
+                    artifact_scope="static_file",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+            flow_descriptor=FlowDescriptor(
+                rules=[
+                    FlowRule(
+                        match_path="/boaform/admin/formLogin",
+                        condition=FlowCondition(missing_cookie="session_token"),
+                        response=FlowResponse(redirect_to="/admin/login.asp", status_code=302),
+                        priority=10,
+                    )
+                ]
+            ),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "requires at least one POST flow rule"):
+            validate_bundle(bundle, request, runtime_config)
+
+    def test_form_handler_flow_requires_visible_failure_feedback_artifact(self):
+        request = ensure_generation_request(
+            "example.com",
+            "/boaform/admin/formLogin",
+            {"index_page": "/index.html"},
+        )
+        runtime_config = self._runtime_config(enable_scripted_flows=True, max_bundle_artifacts=4)
+        bundle = GeneratedBundle(
+            primary_path="/boaform/admin/formLogin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=(
+                        b'<html><body><form method="post" action="/boaform/admin/formLogin">'
+                        b'<input name="username"><input name="password" type="password">'
+                        b'</form></body></html>'
+                    ),
+                    status_code=200,
+                    source_artifact_id="handler",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/boaform-admin-formLogin/post-fail",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>User name or password is error. Please try again.</body></html>',
+                    status_code=200,
+                    source_artifact_id="post-fail",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/boaform-admin-formLogin/post-locked",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>Still no luck.</body></html>',
+                    status_code=200,
+                    source_artifact_id="post-locked",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+            flow_descriptor=FlowDescriptor(
+                rules=[
+                    FlowRule(
+                        match_path="/boaform/admin/formLogin",
+                        condition=FlowCondition(method="POST"),
+                        response=FlowResponse(
+                            artifact_path="/_flow/boaform-admin-formLogin/post-fail",
+                            status_code=200,
+                        ),
+                        priority=5,
+                    ),
+                    FlowRule(
+                        match_path="/boaform/admin/formLogin",
+                        condition=FlowCondition(
+                            method="POST",
+                            min_prior_post_count_to_path=3,
+                            lockout_window_seconds=60,
+                            lockout_active=True,
+                        ),
+                        response=FlowResponse(artifact_path="/_flow/boaform-admin-formLogin/post-locked", status_code=200),
+                        priority=10,
+                    ),
+                ]
+            ),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "visible too-many-attempts lockout artifact"):
+            validate_bundle(bundle, request, runtime_config)
+
+    def test_form_handler_flow_accepts_post_failure_artifact_and_distinct_outcome(self):
+        request = ensure_generation_request(
+            "example.com",
+            "/boaform/admin/formLogin",
+            {"index_page": "/index.html"},
+        )
+        runtime_config = self._runtime_config(enable_scripted_flows=True, max_bundle_artifacts=4)
+        bundle = GeneratedBundle(
+            primary_path="/boaform/admin/formLogin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=(
+                        b'<html><body><form method="post" action="/boaform/admin/formLogin">'
+                        b'<input name="username"><input name="password" type="password">'
+                        b'</form></body></html>'
+                    ),
+                    status_code=200,
+                    source_artifact_id="handler",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/boaform-admin-formLogin/post-fail",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>User name or password is error. Please try again.</body></html>',
+                    status_code=200,
+                    source_artifact_id="post-fail",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/boaform-admin-formLogin/post-locked",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>Too many invalid login attempts. Please wait 1 minute before trying again.</body></html>',
+                    status_code=200,
+                    source_artifact_id="post-locked",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+            flow_descriptor=FlowDescriptor(
+                rules=[
+                    FlowRule(
+                        match_path="/boaform/admin/formLogin",
+                        condition=FlowCondition(method="POST"),
+                        response=FlowResponse(
+                            artifact_path="/_flow/boaform-admin-formLogin/post-fail",
+                            status_code=200,
+                        ),
+                        priority=5,
+                    ),
+                    FlowRule(
+                        match_path="/boaform/admin/formLogin",
+                        condition=FlowCondition(
+                            method="POST",
+                            min_prior_post_count_to_path=3,
+                            lockout_window_seconds=60,
+                            lockout_active=True,
+                        ),
+                        response=FlowResponse(artifact_path="/_flow/boaform-admin-formLogin/post-locked", status_code=200),
+                        priority=10,
+                    ),
+                ]
+            ),
+        )
+
+        validate_bundle(bundle, request, runtime_config)
+
+
+    def test_flow_designer_does_not_add_missing_cookie_guard_to_login_page(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+        request = ensure_generation_request(
+            "example.com",
+            "/boaform/admin/formLogin",
+            {"index_page": "/index.html"},
+        )
+        resource_plan = ResourcePlan(
+            primary_path="/boaform/admin/formLogin",
+            theme_summary="Legacy router admin portal",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login-page",
+                    path="/admin/login.asp",
+                    kind="html_page",
+                    purpose="Login page",
+                    dynamic_candidate=True,
+                ),
+                PlannedArtifact(
+                    artifact_id="login-handler",
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    purpose="Form handler",
+                    artifact_scope="dynamic_endpoint",
+                    dynamic_candidate=True,
+                ),
+            ],
+            bundle_budget_count=4,
+            bundle_budget_bytes=16384,
+            static_only=False,
+            review_focus=["flow"],
+        )
+        bundle = GeneratedBundle(
+            primary_path="/boaform/admin/formLogin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin/login.asp",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=(
+                        b'<html><body><form method="post" action="/boaform/admin/formLogin">'
+                        b'<input name="username"><input name="password" type="password">'
+                        b'</form></body></html>'
+                    ),
+                    status_code=200,
+                    source_artifact_id="login-page",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>handler</body></html>',
+                    status_code=200,
+                    source_artifact_id="login-handler",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+        state = {
+            "request": request,
+            "resource_plan": resource_plan,
+            "generated_bundle": bundle.model_dump(mode="json"),
+        }
+
+        result = self.loop.run_until_complete(generator._flow_designer_node(state))
+        descriptor = FlowDescriptor.model_validate(result["flow_descriptor"])
+
+        self.assertFalse(
+            any(
+                rule.match_path == "/admin/login.asp"
+                and rule.condition is not None
+                and rule.condition.missing_cookie == "session_token"
+                for rule in descriptor.rules
+            )
+        )
+
+
+    def test_flow_evaluator_enforces_three_attempt_loop_with_one_minute_lockout(self):
+        evaluator = FlowEvaluator()
+        evaluator.load_from_dict(
+            "/boaform/admin/formLogin",
+            {
+                "rules": [
+                    {
+                        "match_path": "/boaform/admin/formLogin",
+                        "condition": {
+                            "method": "POST",
+                            "min_prior_post_count_to_path": 3,
+                            "lockout_window_seconds": 60,
+                            "lockout_active": True,
+                        },
+                        "response": {"artifact_path": "/_flow/boaform-admin-formLogin/post-locked", "status_code": 200},
+                        "priority": 10,
+                    },
+                    {
+                        "match_path": "/boaform/admin/formLogin",
+                        "condition": {"method": "POST"},
+                        "response": {"artifact_path": "/_flow/boaform-admin-formLogin/post-fail", "status_code": 200},
+                        "priority": 5,
+                    },
+                ]
+            },
+        )
+
+        class FakeSession:
+            def __init__(self, paths):
+                self.paths = paths
+                self.cookies = {}
+
+        base_ts = 1000.0
+        first = evaluator.evaluate(FakeSession([{"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts}]), "/boaform/admin/formLogin", {"method": "POST"})
+        second = evaluator.evaluate(FakeSession([
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 1},
+        ]), "/boaform/admin/formLogin", {"method": "POST"})
+        third = evaluator.evaluate(FakeSession([
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 1},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 2},
+        ]), "/boaform/admin/formLogin", {"method": "POST"})
+        locked = evaluator.evaluate(FakeSession([
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 1},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 2},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 10},
+        ]), "/boaform/admin/formLogin", {"method": "POST"})
+        reset = evaluator.evaluate(FakeSession([
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 1},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 2},
+            {"path": "/boaform/admin/formLogin", "method": "POST", "timestamp": base_ts + 65},
+        ]), "/boaform/admin/formLogin", {"method": "POST"})
+
+        self.assertEqual(first.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
+        self.assertEqual(second.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
+        self.assertEqual(third.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
+        self.assertEqual(locked.artifact_path, "/_flow/boaform-admin-formLogin/post-locked")
+        self.assertEqual(reset.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")

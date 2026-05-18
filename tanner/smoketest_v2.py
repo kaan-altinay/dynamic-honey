@@ -1,0 +1,392 @@
+"""
+V2 smoketest: generate a bundle with scripted flows enabled and serve it
+interactively so flow rules (redirects, rewrites, cookie gating) fire in
+the preview browser exactly as they would at runtime.
+
+Usage:
+    cd /home/kaan/dynamic-honey/tanner
+    .venv/bin/python smoketest_v2.py [/optional/path]
+
+Then open http://127.0.0.1:8765<path> in your local browser (via SSH port
+forward).  Cookies and session history are tracked across requests so you
+can walk through the full flow: GET login → POST credentials → redirect →
+gated admin page.
+
+SSH port forward (run on your local machine):
+    ssh -L 8765:127.0.0.1:8765 proxmox-vm
+"""
+
+import asyncio
+import http.cookies
+import json
+import sys
+import time
+import traceback
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
+from tanner.flow.flow_evaluator import FlowEvaluator, FlowMatchResult
+from tanner.generator.agentic.models import (
+    FlowDescriptor,
+    GeneratorRoleConfig,
+    GeneratorRuntimeConfig,
+)
+from tanner.generator.agentic.workflow import AgenticBundleGenerator
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def role(model: str, temperature: float, max_tokens: int) -> GeneratorRoleConfig:
+    return GeneratorRoleConfig(
+        provider="openai",
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=120,
+        max_retries=1,
+    )
+
+
+def dump(value):
+    if hasattr(value, "model_dump_json"):
+        try:
+            return value.model_dump_json(indent=2)
+        except Exception:
+            pass
+    return json.dumps(value, indent=2, default=str)
+
+
+def print_flow_descriptor(descriptor: FlowDescriptor) -> None:
+    print(f"\n  {len(descriptor.rules)} rule(s):")
+    for i, rule in enumerate(sorted(descriptor.rules, key=lambda r: -r.priority)):
+        cond = rule.condition
+        resp = rule.response
+        cond_str = "always"
+        if cond:
+            parts = []
+            if cond.method:
+                parts.append(f"method={cond.method}")
+            if cond.requires_cookie:
+                parts.append(f"cookie '{cond.requires_cookie}' present")
+            if cond.missing_cookie:
+                parts.append(f"cookie '{cond.missing_cookie}' absent")
+            if cond.requires_prev_path:
+                parts.append(f"prev={cond.requires_prev_path}")
+            if cond.min_post_count_to_path:
+                parts.append(f"post_count>={cond.min_post_count_to_path}")
+            if cond.min_prior_post_count_to_path:
+                parts.append(f"prior_post_count>={cond.min_prior_post_count_to_path}")
+            if cond.lockout_window_seconds:
+                parts.append(f"lockout_window={cond.lockout_window_seconds}s")
+            if cond.lockout_active is True:
+                parts.append("lockout=active")
+            elif cond.lockout_active is False:
+                parts.append("lockout=inactive")
+            cond_str = ", ".join(parts) if parts else "always"
+        action = []
+        if resp.redirect_to:
+            action.append(f"302 -> {resp.redirect_to}")
+        if resp.artifact_path:
+            action.append(f"serve {resp.artifact_path}")
+        if resp.set_cookie:
+            action.append(f"set-cookie {resp.set_cookie}")
+        if resp.clear_cookie:
+            action.append(f"clear-cookie {resp.clear_cookie}")
+        print(f"  [{i+1}] priority={rule.priority}  {rule.match_path}  ({cond_str})")
+        print(f"       → {', '.join(action)}")
+
+
+# ── tracing subclass ──────────────────────────────────────────────────────────
+
+class TracingGenerator(AgenticBundleGenerator):
+    async def _invoke_structured(self, role_name: str, schema, messages):
+        print(f"\n=== INVOKING {role_name.upper()} ({schema.__name__}) ===")
+        try:
+            result = await super()._invoke_structured(role_name, schema, messages)
+            print(f"=== MODEL SUCCESS: {role_name.upper()} ===")
+            print(dump(result))
+            return result
+        except Exception:
+            print(f"=== MODEL FAILURE: {role_name.upper()} ===")
+            traceback.print_exc()
+            raise
+
+
+# ── session store ─────────────────────────────────────────────────────────────
+# Keyed by smoketest_sid cookie.  Tracks path history and cookies for each
+# browser session so flow conditions (prev_path, post_count, cookie checks)
+# evaluate correctly across requests.
+
+_sessions: dict[str, dict] = {}
+
+
+def _get_or_create_session(sid: str | None) -> tuple[str, dict]:
+    if sid and sid in _sessions:
+        return sid, _sessions[sid]
+    new_sid = uuid.uuid4().hex
+    _sessions[new_sid] = {"cookies": {}, "paths": []}
+    return new_sid, _sessions[new_sid]
+
+
+def _parse_cookies(cookie_header: str | None) -> dict[str, str]:
+    if not cookie_header:
+        return {}
+    c = http.cookies.SimpleCookie()
+    try:
+        c.load(cookie_header)
+    except Exception:
+        pass
+    return {k: v.value for k, v in c.items()}
+
+
+# ── fake session object for FlowEvaluator ────────────────────────────────────
+
+class _FakeSession:
+    """Minimal Session interface that FlowEvaluator expects."""
+    def __init__(self, session_data: dict):
+        self.cookies = session_data["cookies"]
+        self.paths = session_data["paths"]
+
+
+# ── preview server handler factory ───────────────────────────────────────────
+
+def make_handler(bundle, evaluator: FlowEvaluator | None):
+    artifact_map = {a.path: a for a in bundle.artifacts}
+    index_page = "/index.html"
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def _serve(self, method: str):
+            bare_path = self.path.split("?")[0]
+            raw_cookies = self.headers.get("Cookie")
+            request_cookies = _parse_cookies(raw_cookies)
+
+            # resolve or create smoketest session
+            sid = request_cookies.get("smoketest_sid")
+            sid, sess_data = _get_or_create_session(sid)
+
+            # merge any cookies the browser already carries into the session
+            sess_data["cookies"].update(
+                {k: v for k, v in request_cookies.items() if k != "smoketest_sid"}
+            )
+
+            # record this request in history (before evaluation, same as
+            # session_manager.add_or_update_session in production)
+            sess_data["paths"].append({"path": bare_path, "method": method, "timestamp": time.time()})
+
+            fake_session = _FakeSession(sess_data)
+
+            # ── flow evaluation ───────────────────────────────────────────
+            flow_result: FlowMatchResult | None = None
+            if evaluator is not None:
+                flow_result = evaluator.evaluate(fake_session, bare_path, {"method": method})
+                if flow_result.matched:
+                    print(
+                        f"  [FLOW] {method} {bare_path} → "
+                        + (f"302 {flow_result.redirect_to}" if flow_result.redirect_to
+                           else f"rewrite → {flow_result.artifact_path}")
+                    )
+
+            # ── determine which artifact to serve ─────────────────────────
+            lookup_path = bare_path
+            status_code = 200
+
+            if flow_result and flow_result.matched:
+                status_code = flow_result.status_code
+                if flow_result.redirect_to:
+                    # synthetic redirect — no artifact needed
+                    self._send_redirect(
+                        flow_result.redirect_to,
+                        sid,
+                        flow_result.set_cookie,
+                        flow_result.clear_cookie,
+                        sess_data,
+                    )
+                    return
+                if flow_result.artifact_path:
+                    lookup_path = flow_result.artifact_path
+
+            # root → primary path
+            if lookup_path == "/":
+                lookup_path = bundle.primary_path
+
+            artifact = artifact_map.get(lookup_path)
+
+            # baseline index page fallback
+            if artifact is None and lookup_path == index_page:
+                self._send_redirect(bundle.primary_path, sid, {}, [], sess_data)
+                return
+
+            if artifact is None:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self._set_sid_cookie(sid)
+                self.end_headers()
+                self.wfile.write(
+                    f"404 Not found: {lookup_path}\n\nBundle paths:\n".encode()
+                    + "\n".join(sorted(artifact_map)).encode()
+                )
+                return
+
+            # ── normal artifact response ───────────────────────────────────
+            self.send_response(status_code)
+
+            content_type = None
+            for header in artifact.headers:
+                if isinstance(header, dict):
+                    for key, value in header.items():
+                        if key.lower() == "content-type":
+                            content_type = value
+                        self.send_header(key, value)
+            if content_type is None:
+                self.send_header("Content-Type", "application/octet-stream")
+
+            # apply flow cookies to both session store and response headers
+            if flow_result and flow_result.matched:
+                for name, value in flow_result.set_cookie.items():
+                    sess_data["cookies"][name] = value
+                    self.send_header("Set-Cookie", f"{name}={value}; Path=/; HttpOnly")
+                for name in flow_result.clear_cookie:
+                    sess_data["cookies"].pop(name, None)
+                    self.send_header(
+                        "Set-Cookie", f"{name}=; Path=/; Max-Age=0; HttpOnly"
+                    )
+
+            self._set_sid_cookie(sid)
+            self.end_headers()
+            self.wfile.write(artifact.body_bytes)
+
+        def _send_redirect(
+            self,
+            location: str,
+            sid: str,
+            set_cookie: dict,
+            clear_cookie: list,
+            sess_data: dict,
+        ):
+            self.send_response(302)
+            self.send_header("Location", location)
+            for name, value in set_cookie.items():
+                sess_data["cookies"][name] = value
+                self.send_header("Set-Cookie", f"{name}={value}; Path=/; HttpOnly")
+            for name in clear_cookie:
+                sess_data["cookies"].pop(name, None)
+                self.send_header(
+                    "Set-Cookie", f"{name}=; Path=/; Max-Age=0; HttpOnly"
+                )
+            self._set_sid_cookie(sid)
+            self.end_headers()
+
+        def _set_sid_cookie(self, sid: str):
+            self.send_header("Set-Cookie", f"smoketest_sid={sid}; Path=/")
+
+        def do_GET(self):
+            self._serve("GET")
+
+        def do_POST(self):
+            # consume body so the connection stays clean
+            length = int(self.headers.get("Content-Length", 0))
+            _ = self.rfile.read(length)
+            self._serve("POST")
+
+        def log_message(self, fmt, *args):
+            print(f"  {self.address_string()} {fmt % args}")
+
+    return Handler
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+async def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "/wp-login.php"
+
+    model_name = "gpt-5.4"
+
+    cfg = GeneratorRuntimeConfig(
+        backend="agentic",
+        enable_scripted_flows=True,          # V2
+        max_review_loops=1,
+        max_bundle_artifacts=8,
+        max_bundle_bytes=2_000_000,
+        checkpoint_path="/tmp/tanner-agentic-v2-smoketest.sqlite",
+        graph_recursion_limit=200,
+        review_log_path="/tmp/tanner-agentic-v2-review-log.json",
+        enable_live_research=True,
+        max_tool_response_chars=4_000,
+        max_command_output_chars=2_000,
+        command_timeout=2,
+        max_concurrent_model_calls=1,
+        inter_call_delay_seconds=12.5,
+        max_rate_limit_retries=3,
+        default_rate_limit_backoff_seconds=12.0,
+        max_length_limit_retries=3,
+        length_retry_token_increase=800,
+        max_length_retry_tokens=6_000,
+        roles={
+            "expert": role(model_name, 0.0, 1800),
+            "design": role(model_name, 0.0, 2800),
+            "coder": role(model_name, 0.1, 1600),
+            "review": role(model_name, 0.0, 1600),
+        },
+    )
+
+    generator = TracingGenerator(runtime_config=cfg)
+
+    print(f"\n=== GENERATING V2 BUNDLE: {path} ===")
+    bundle = await generator.generate_bundle(
+        host="example.com",
+        path=path,
+        site_profile={"index_page": "/index.html"},
+    )
+
+    print("\n=== FINAL BUNDLE ===")
+    print("primary_path :", bundle.primary_path)
+    print("used_fallback:", bundle.used_fallback)
+    print("review_summary:", bundle.review_summary)
+    print(f"artifacts ({len(bundle.artifacts)}):")
+    for a in sorted(bundle.artifacts, key=lambda x: x.path):
+        tag = "  [flow variant]" if a.path.startswith("/_flow/") else ""
+        print(f"  {a.path:50s}  {a.kind:20s}  {len(a.body_bytes):>7,} bytes{tag}")
+
+    # ── flow descriptor ───────────────────────────────────────────────────────
+    evaluator: FlowEvaluator | None = None
+
+    if bundle.flow_descriptor is not None:
+        print(f"\n=== FLOW DESCRIPTOR ===")
+        print_flow_descriptor(bundle.flow_descriptor)
+        evaluator = FlowEvaluator()
+        evaluator.register(bundle.primary_path, bundle.flow_descriptor)
+    else:
+        print("\n=== FLOW DESCRIPTOR: none generated ===")
+        print("  (design node did not produce /_flow/ variants or dynamic_candidate paths)")
+        print("  Try a login/admin path: smoketest_v2.py /wp-admin/login.php")
+
+    # ── preview server ────────────────────────────────────────────────────────
+    handler_class = make_handler(bundle, evaluator)
+    server = ThreadingHTTPServer(("127.0.0.1", 8765), handler_class)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    print("\n=== PREVIEW SERVER ===")
+    print("SSH port forward (run on your LOCAL machine):")
+    print("  ssh -L 8765:127.0.0.1:8765 proxmox-vm")
+    print(f"\nThen open:  http://127.0.0.1:8765{bundle.primary_path}")
+    print()
+    if evaluator:
+        print("Flow rules are live.  Cookies and request history persist across")
+        print("requests in the same browser session.  To reset session state,")
+        print("clear cookies or open a private window.")
+    print("\nPress Ctrl+C to stop.")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print("\nPreview stopped.")

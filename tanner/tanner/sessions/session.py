@@ -18,7 +18,7 @@ class Session:
             self.port = data["peer"]["port"]
             self.user_agent = data["headers"]["user-agent"]
             self.snare_uuid = data["uuid"]
-            self.paths = [{"path": data["path"], "timestamp": time.time(), "response_status": data["status"]}]
+            self.paths = [{"path": data["path"], "timestamp": time.time(), "response_status": data["status"], "method": data.get("method", "GET")}]
             self.referer = None
             if "referer" in data["headers"]:
                 ref = urlparse(data["headers"]["referer"])
@@ -37,7 +37,7 @@ class Session:
     def update_session(self, data):
         self.timestamp = time.time()
         self.count += 1
-        self.paths.append({"path": data["path"], "timestamp": time.time(), "response_status": data["status"]})
+        self.paths.append({"path": data["path"], "timestamp": time.time(), "response_status": data["status"], "method": data.get("method", "GET")})
         for (key, value) in data["cookies"].items():
             self.cookies.update({key: value})
 

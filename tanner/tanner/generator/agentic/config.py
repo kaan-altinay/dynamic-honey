@@ -34,6 +34,8 @@ def load_runtime_config() -> GeneratorRuntimeConfig:
     return GeneratorRuntimeConfig(
         backend=str(_config_value("backend", "agentic")),
         max_review_loops=int(_config_value("max_review_loops", 2)),
+        max_design_validation_loops=int(_config_value("max_design_validation_loops", 2)),
+        allow_fallback_persistence=bool(_config_value("allow_fallback_persistence", False)),
         max_bundle_artifacts=int(_config_value("max_bundle_artifacts", 4)),
         max_bundle_bytes=int(_config_value("max_bundle_bytes", 262_144)),
         checkpoint_path=str(_config_value("checkpoint_path", "/tmp/tanner-agentic-checkpoints.sqlite")),
@@ -50,5 +52,6 @@ def load_runtime_config() -> GeneratorRuntimeConfig:
         max_length_limit_retries=int(_config_value("max_length_limit_retries", 2)),
         length_retry_token_increase=int(_config_value("length_retry_token_increase", 800)),
         max_length_retry_tokens=int(_config_value("max_length_retry_tokens", 6000)),
+        enable_scripted_flows=bool(_config_value("enable_scripted_flows", False)),
         roles=roles,
     )

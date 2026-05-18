@@ -20,6 +20,10 @@ from tanner.generator.agentic.config import load_runtime_config
 from tanner.generator.agentic.fallback import build_fallback_bundle
 from tanner.generator.agentic.model_factory import build_role_model
 from tanner.generator.agentic.models import (
+    FlowCondition,
+    FlowDescriptor,
+    FlowResponse,
+    FlowRule,
     ArtifactDraft,
     ArtifactReferenceContext,
     ExpertSpec,
@@ -81,6 +85,7 @@ class GraphState(TypedDict, total=False):
     trace_notes: Annotated[list[str], operator.add]
     errors: Annotated[list[str], operator.add]
     plan_revision: int
+    flow_descriptor: dict  # serialized FlowDescriptor when V2 active
 
 
 class AgenticBundleGenerator(BaseGenerator):
@@ -89,10 +94,22 @@ class AgenticBundleGenerator(BaseGenerator):
         self.runtime_config = runtime_config or load_runtime_config()
         self._review_log_path = Path(self.runtime_config.review_log_path)
         self._role_models = {}
+        self._invoke_loop = None
+        self._invoke_semaphore = None
+        self._invoke_spacing_lock = None
+        self._next_model_call_time = 0.0
+        self._graph_builder = self._build_graph()
+
+    def _ensure_invoke_primitives(self) -> None:
+        """Initialize loop-bound asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        if self._invoke_loop is loop and self._invoke_semaphore is not None and self._invoke_spacing_lock is not None:
+            return
+
+        self._invoke_loop = loop
         self._invoke_semaphore = asyncio.Semaphore(self.runtime_config.max_concurrent_model_calls)
         self._invoke_spacing_lock = asyncio.Lock()
         self._next_model_call_time = 0.0
-        self._graph_builder = self._build_graph()
 
     def _build_graph(self):
         builder = StateGraph(GraphState)
@@ -119,10 +136,16 @@ class AgenticBundleGenerator(BaseGenerator):
         builder.add_conditional_edges("prepare_reference_pack", self._fan_out_coders, ["coder_node"])
         builder.add_edge("coder_node", "assemble_bundle")
         builder.add_edge("assemble_bundle", "review_node")
+        if self.runtime_config.enable_scripted_flows:
+            builder.add_node("flow_designer", self._flow_designer_node)
+            builder.add_edge("flow_designer", "finalize_bundle")
+            approve_target = "flow_designer"
+        else:
+            approve_target = "finalize_bundle"
         builder.add_conditional_edges(
             "review_node",
             self._route_after_review,
-            {"approve": "finalize_bundle", "revise": "design_node", "fallback": "fallback_node"},
+            {"approve": approve_target, "revise": "design_node", "fallback": "fallback_node"},
         )
         builder.add_edge("finalize_bundle", END)
         builder.add_edge("fallback_node", END)
@@ -195,6 +218,8 @@ class AgenticBundleGenerator(BaseGenerator):
         return self.runtime_config.default_rate_limit_backoff_seconds
 
     async def _wait_for_model_slot(self) -> None:
+        self._ensure_invoke_primitives()
+
         inter_call_delay = self.runtime_config.inter_call_delay_seconds
         if inter_call_delay <= 0:
             return
@@ -208,6 +233,8 @@ class AgenticBundleGenerator(BaseGenerator):
             self._next_model_call_time = now + inter_call_delay
 
     async def _invoke_structured(self, role_name: str, schema, messages):
+        self._ensure_invoke_primitives()
+
         base_max_tokens = self.runtime_config.role_config(role_name).max_tokens
         current_max_tokens = base_max_tokens
         rate_limit_attempt = 0
@@ -726,6 +753,19 @@ class AgenticBundleGenerator(BaseGenerator):
 
         return {"expert_spec": expert_spec, "trace_notes": ["expert:{}".format(expert_spec.intent_family)]}
 
+    def _static_mode_design_rule(self) -> str:
+        if self.runtime_config.enable_scripted_flows:
+            return (
+                "Scripted-flow mode is enabled: dynamic_endpoint/service_stub scopes are allowed only "
+                "when the endpoint truly requires stateful behavior."
+            )
+        return (
+            "V1 static mode is active: ResourcePlan.static_only MUST be true; every artifact_scope MUST "
+            "be static_file; dynamic_candidate and service_candidate MUST be false; do not use "
+            "dynamic_endpoint or service_stub. Approximate login/auth/API interactions with static "
+            "HTML/JSON/text artifacts instead of stateful flow artifacts."
+        )
+
     async def _design_node(self, state: GraphState):
         request = state["request"]
         expert_spec = state["expert_spec"]
@@ -756,8 +796,8 @@ class AgenticBundleGenerator(BaseGenerator):
                     "role": "system",
                 "content": (
                     "You are the Design role in a honeypot bundle generator. "
-                    "Plan a static-only bundle that satisfies the requested path and its nearby context.\n\n"
-                    "Requirements:\n"
+                    "Plan a realistic bundle that satisfies the requested path and its nearby context. "
+                    "For authentication-like entry points, include a stateful deception flow only when scripted flows are enabled; otherwise model a static first response.\\n\\n"
                     "- At least 2 generated artifacts required (one primary, plus supporting artifacts)\n"
                     "- Up to {max_artifacts} total outputs (generated artifacts + fetched assets)\n"
                     "- Choose exactly one representation per local path: generated artifact OR fetched asset, never both\n"
@@ -770,8 +810,18 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- artifact.response_contract: Define per-artifact HTTP contract with status_code, content_type, and optional headers_hint (name/value pairs)\n"
                     "- reference_asset_plan.asset_fetches: Remote assets you want copied locally for realism. Use this when you need a file derived from a real external source URL\n"
                     "- reference_asset_plan.reference_urls: List the selected reference pages used to justify the design\n\n"
-                    "Always use default values for: render_strategy='deterministic', artifact_scope='static_file', must_exist=true, dynamic_candidate=false, service_candidate=false"
-                ).format(max_artifacts=self.runtime_config.max_bundle_artifacts),
+                    "Default values: render_strategy='deterministic', artifact_scope='static_file', must_exist=true, service_candidate=false. "
+                    "For scripted-flow mode, any generated HTML page with a POST form must define executable POST behavior on the form action path. "
+                    "The first three invalid submissions must each serve a visible invalid-credentials response artifact. "
+                    "Subsequent POSTs during the next 60 seconds must serve a visible too-many-attempts/lockout artifact. "
+                    "After that cooldown elapses, the same three-attempt cycle restarts for that client. Do not rely only on "
+                    "a missing-cookie redirect back to the login page.\n"
+                    "Set dynamic_candidate=true for endpoints that should participate in a stateful login/auth flow.\\n"
+                    "{static_mode_rule}"
+                ).format(
+                    max_artifacts=self.runtime_config.max_bundle_artifacts,
+                    static_mode_rule=self._static_mode_design_rule(),
+                ),
                 },
                 {
                     "role": "user",
@@ -886,7 +936,12 @@ class AgenticBundleGenerator(BaseGenerator):
 
     def _design_revise_or_fallback(self, state: GraphState, reasons: list[str]):
         next_iteration = state.get("design_validation_iteration", 0) + 1
-        if next_iteration >= self.runtime_config.max_review_loops:
+        max_design_validation_loops = getattr(
+            self.runtime_config,
+            "max_design_validation_loops",
+            self.runtime_config.max_review_loops,
+        )
+        if next_iteration >= max_design_validation_loops:
             decision = "fallback"
         else:
             decision = "revise"
@@ -977,7 +1032,6 @@ class AgenticBundleGenerator(BaseGenerator):
         )
 
     async def _prepare_reference_pack(self, state: GraphState):
-        request = state["request"]
         resource_plan = state["resource_plan"]
         reference_urls = list(resource_plan.reference_asset_plan.reference_urls)
         if not reference_urls:
@@ -1068,6 +1122,11 @@ class AgenticBundleGenerator(BaseGenerator):
         return sends
 
     _PLACEHOLDER_TOKEN_RE = re.compile(r"\b(example|sample)\b", re.IGNORECASE)
+    _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+    _LOGIN_PATH_HINT_RE = re.compile(
+        r"(?:^|/)(?:wp-login|login|logon|signin|sign-in|auth|account|session|formlogin|form-login)(?:$|[/?._-])",
+        re.IGNORECASE,
+    )
 
     @staticmethod
     def _replace_placeholder_tokens(value: str) -> tuple[str, int]:
@@ -1081,6 +1140,33 @@ class AgenticBundleGenerator(BaseGenerator):
 
         sanitized_value, replacements = AgenticBundleGenerator._PLACEHOLDER_TOKEN_RE.subn(_replacement, value)
         return sanitized_value, replacements
+
+    @staticmethod
+    def _strip_control_chars(value: str) -> tuple[str, int]:
+        sanitized_value, replacements = AgenticBundleGenerator._CONTROL_CHAR_RE.subn("", value)
+        return sanitized_value, replacements
+
+    @staticmethod
+    def _scrub_control_chars(value):
+        if isinstance(value, dict):
+            total = 0
+            sanitized = {}
+            for key, item in value.items():
+                sanitized_item, count = AgenticBundleGenerator._scrub_control_chars(item)
+                sanitized[key] = sanitized_item
+                total += count
+            return sanitized, total
+        if isinstance(value, list):
+            total = 0
+            sanitized = []
+            for item in value:
+                sanitized_item, count = AgenticBundleGenerator._scrub_control_chars(item)
+                sanitized.append(sanitized_item)
+                total += count
+            return sanitized, total
+        if isinstance(value, str):
+            return AgenticBundleGenerator._strip_control_chars(value)
+        return value, 0
 
     @staticmethod
     def _scrub_placeholder_content(value, *, parent_key: str | None = None):
@@ -1108,7 +1194,6 @@ class AgenticBundleGenerator(BaseGenerator):
                 return value, 0
             return AgenticBundleGenerator._replace_placeholder_tokens(value)
         return value, 0
-
 
     @staticmethod
     def _sanitize_artifact_draft(
@@ -1182,6 +1267,14 @@ class AgenticBundleGenerator(BaseGenerator):
                     model["form"] = {**form, "action": draft.path}
                     notes.append("sanitized form.action -> {}".format(draft.path))
 
+        model, control_char_replacements = AgenticBundleGenerator._scrub_control_chars(model)
+        if control_char_replacements > 0:
+            notes.append(
+                "sanitized control characters: removed {} non-printable byte(s)".format(
+                    control_char_replacements
+                )
+            )
+
         model, placeholder_replacements = AgenticBundleGenerator._scrub_placeholder_content(model)
         if placeholder_replacements > 0:
             notes.append(
@@ -1189,7 +1282,6 @@ class AgenticBundleGenerator(BaseGenerator):
                     placeholder_replacements
                 )
             )
-
         return ArtifactDraft(
             artifact_id=draft.artifact_id,
             path=draft.path,
@@ -1613,12 +1705,21 @@ class AgenticBundleGenerator(BaseGenerator):
             bundle.artifacts,
             key=lambda artifact: (artifact.path != bundle.primary_path, artifact.path),
         )
+        # Carry V2 flow descriptor from state if the flow_designer node produced one
+        flow_descriptor = None
+        flow_dict = state.get("flow_descriptor")
+        if flow_dict is not None:
+            try:
+                flow_descriptor = FlowDescriptor.model_validate(flow_dict)
+            except Exception:
+                self.logger.warning("_finalize_bundle: invalid flow_descriptor in state; discarding")
         finalized = bundle.model_copy(
             update={
                 "artifacts": artifacts,
                 "review_summary": "; ".join(review_decision.reasons) if review_decision and review_decision.reasons else (
                     review_decision.decision if review_decision else bundle.review_summary
                 ),
+                "flow_descriptor": flow_descriptor,
             }
         )
         validate_bundle(finalized, request, self.runtime_config)
@@ -2184,8 +2285,8 @@ class AgenticBundleGenerator(BaseGenerator):
                 "Adjacent files should imply a live production environment rather than a toy sample.",
             ],
             "cms_probe": [
-                "The primary page should feel like a WordPress administrative surface with familiar assets.",
-                "Linked support files should resolve locally and avoid dynamic server behavior.",
+                "The primary page should look like a believable CMS/admin entry surface with familiar assets.",
+                "For login-like forms, include a stateful deception flow (failed-attempt and lockout/redirect-style outcomes) without implementing real authentication.",
             ],
             "backup_probe": [
                 "The bundle should hint at operational exports and recovery workflows.",
@@ -2214,8 +2315,8 @@ class AgenticBundleGenerator(BaseGenerator):
                 "Keep the file compact enough to look harvested from a real deployment.",
             ],
             "cms_probe": [
-                "Match common WordPress login terminology and page structure.",
-                "Reference nearby static assets that SNARE can persist and serve later.",
+                "Match common CMS login terminology and page structure with realistic field names.",
+                "When forms submit with POST on login-like endpoints, include a stateful flow plan so repeated attempts do not always re-serve the same base page.",
             ],
             "backup_probe": [
                 "Imply a recent backup workflow with concrete file names.",
@@ -2227,7 +2328,7 @@ class AgenticBundleGenerator(BaseGenerator):
             ],
             "framework_probe": [
                 "Expose enough structure to suggest a framework-specific surface.",
-                "Avoid dynamic behavior or server-side execution assumptions.",
+                "Use deterministic static artifacts for baseline endpoints; only add stateful behavior where authentication-like form interactions make it plausible.",
             ],
             "generic_recon": [
                 "Provide a believable static entry point for further browsing.",
@@ -2316,6 +2417,397 @@ class AgenticBundleGenerator(BaseGenerator):
             {"key": "MAIL_USERNAME", "value": "mailer@internal.example"},
             {"key": "MAIL_PASSWORD", "value": "M4ilP@ss!2026"},
         ]
+
+
+    # ── V2: flow designer node ─────────────────────────────────────────────
+
+    async def _flow_designer_node(self, state: GraphState) -> dict:
+        """
+        Build a FlowDescriptor from explicit /_flow/ variant artifacts and
+        synthesize minimal login POST flow behavior when no variants exist.
+        """
+        request = state["request"]
+        resource_plan = state["resource_plan"]
+        bundle = GeneratedBundle.model_validate(state["generated_bundle"])
+
+        generated_paths = {a.path for a in bundle.artifacts}
+        dynamic_paths = {
+            a.path for a in resource_plan.artifacts if getattr(a, "dynamic_candidate", False)
+        }
+
+        login_post_targets: set[str] = set()
+        for artifact in bundle.artifacts:
+            login_post_targets.update(self._extract_post_form_targets(artifact, request))
+        for target in login_post_targets:
+            dynamic_paths.add(target)
+
+        slug_to_path: dict[str, str] = {
+            self._path_to_slug(p): p
+            for p in generated_paths
+            if not p.startswith("/_flow/")
+        }
+
+        rules: list[FlowRule] = []
+
+        # Process explicit /_flow/ variant artifacts first
+        for artifact in bundle.artifacts:
+            if not artifact.path.startswith("/_flow/"):
+                continue
+            parts = artifact.path.lstrip("/").split("/")
+            # expected: ["_flow", slug, variant_name]
+            if len(parts) != 3:
+                self.logger.debug("flow_designer: skipping unexpected path %s", artifact.path)
+                continue
+            _, slug, variant_name = parts
+            parent_path = slug_to_path.get(slug)
+            if parent_path is None:
+                self.logger.debug(
+                    "flow_designer: no parent path for slug %r (path %s)", slug, artifact.path
+                )
+                continue
+            rule = self._variant_to_rule(parent_path, variant_name, artifact.path, generated_paths)
+            if rule is not None:
+                rules.append(rule)
+
+        # Synthesize generic login POST flow if missing.
+        mutable_artifacts = list(bundle.artifacts)
+        for path in sorted(login_post_targets):
+
+            existing_post_rules = [
+                r
+                for r in rules
+                if r.match_path == path
+                and r.condition is not None
+                and (r.condition.method or "").upper() == "POST"
+            ]
+            has_artifact_post_outcome = any(r.response.artifact_path for r in existing_post_rules)
+            existing_outcomes = {
+                (r.response.artifact_path, r.response.redirect_to, r.response.status_code)
+                for r in existing_post_rules
+            }
+
+            slug = self._path_to_slug(path)
+            fail_variant_path = "/_flow/{}/post-fail".format(slug)
+            if not has_artifact_post_outcome and fail_variant_path not in generated_paths:
+                source = next(
+                    (a for a in mutable_artifacts if a.path == path and a.kind == "html_page"),
+                    None,
+                )
+                if source is None:
+                    source = self._find_html_form_source_for_target(mutable_artifacts, path, request)
+                if source is not None:
+                    synthetic = self._build_post_fail_variant_artifact(source, fail_variant_path)
+                    mutable_artifacts.append(synthetic)
+                    generated_paths.add(fail_variant_path)
+
+            if not any(
+                r.match_path == path
+                and r.condition is not None
+                and (r.condition.method or "").upper() == "POST"
+                and r.response.artifact_path == fail_variant_path
+                for r in rules
+            ) and fail_variant_path in generated_paths:
+                rules.append(
+                    FlowRule(
+                        match_path=path,
+                        condition=FlowCondition(method="POST"),
+                        response=FlowResponse(artifact_path=fail_variant_path, status_code=200),
+                        priority=5,
+                    )
+                )
+                existing_outcomes.add((fail_variant_path, None, 200))
+
+            locked_variant_path = "/_flow/{}/post-locked".format(slug)
+            has_locked_artifact = any(
+                r.response.artifact_path == locked_variant_path for r in existing_post_rules
+            )
+            if not has_locked_artifact and locked_variant_path not in generated_paths:
+                source = next(
+                    (a for a in mutable_artifacts if a.path == path and a.kind == "html_page"),
+                    None,
+                )
+                if source is None:
+                    source = self._find_html_form_source_for_target(mutable_artifacts, path, request)
+                if source is not None:
+                    synthetic = self._build_post_locked_variant_artifact(source, locked_variant_path)
+                    mutable_artifacts.append(synthetic)
+                    generated_paths.add(locked_variant_path)
+
+            if not any(
+                r.match_path == path
+                and r.condition is not None
+                and (r.condition.method or "").upper() == "POST"
+                and r.response.artifact_path == locked_variant_path
+                for r in rules
+            ) and locked_variant_path in generated_paths:
+                rules.append(
+                    FlowRule(
+                        match_path=path,
+                        condition=FlowCondition(
+                            method="POST",
+                            min_prior_post_count_to_path=3,
+                            lockout_window_seconds=60,
+                            lockout_active=True,
+                        ),
+                        response=FlowResponse(artifact_path=locked_variant_path, status_code=200),
+                        priority=10,
+                    )
+                )
+
+        # Implicit auth guard for dynamic_candidate admin/gated pages with no no-auth rule.
+        # Do not attach the guard to POST form handlers themselves; otherwise a
+        # missing-cookie redirect hides the invalid-credential POST variant.
+        for path in sorted(dynamic_paths):
+            if path in login_post_targets or self._is_login_path(path):
+                continue
+            if not self._is_gated_path(path):
+                continue
+            if any(
+                r.match_path == path and r.condition and r.condition.missing_cookie is not None
+                for r in rules
+            ):
+                continue
+            login_path = next(
+                (p for p in sorted(generated_paths) if self._is_login_path(p)), None
+            )
+            if login_path:
+                rules.append(
+                    FlowRule(
+                        match_path=path,
+                        condition=FlowCondition(missing_cookie="session_token"),
+                        response=FlowResponse(redirect_to=login_path, status_code=302),
+                        priority=10,
+                    )
+                )
+
+        if not rules:
+            self.logger.info("flow_designer: no rules produced for this bundle")
+            return {}
+
+        bundle = bundle.model_copy(update={"artifacts": mutable_artifacts})
+        descriptor = FlowDescriptor(rules=rules)
+        self.logger.info(
+            "flow_designer: produced %d flow rule(s) for bundle %s",
+            len(rules),
+            bundle.primary_path,
+        )
+        return {
+            "generated_bundle": bundle,
+            "flow_descriptor": descriptor.model_dump(),
+        }
+
+    @staticmethod
+    def _extract_post_form_targets(artifact: GeneratedArtifact, request: GenerationRequest) -> set[str]:
+        if artifact.kind != "html_page" or artifact.path.startswith("/_flow/"):
+            return set()
+
+        body_text = artifact.body_bytes.decode("utf-8", errors="replace")
+        form_tag_re = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
+        method_re = re.compile(r"\bmethod\s*=\s*[\"\']?([^\"\'\s>]+)", re.IGNORECASE)
+        action_re = re.compile(r"\baction\s*=\s*[\"\']([^\"\']+)", re.IGNORECASE)
+
+        targets: set[str] = set()
+        for form_tag in form_tag_re.findall(body_text):
+            method_match = method_re.search(form_tag)
+            method = method_match.group(1).strip().upper() if method_match else "GET"
+            if method != "POST":
+                continue
+
+            action_match = action_re.search(form_tag)
+            action = action_match.group(1).strip() if action_match else artifact.path
+            if not action or _is_external_reference(action):
+                continue
+            normalized = normalize_path(action, index_page=request.index_page)
+            if normalized.startswith("/_flow/"):
+                continue
+            targets.add(normalized)
+        return targets
+
+    @staticmethod
+    def _find_html_form_source_for_target(
+        artifacts: list[GeneratedArtifact],
+        target_path: str,
+        request: GenerationRequest,
+    ) -> GeneratedArtifact | None:
+        form_tag_re = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
+        method_re = re.compile(r"\bmethod\s*=\s*[\"\']?([^\"\'\s>]+)", re.IGNORECASE)
+        action_re = re.compile(r"\baction\s*=\s*[\"\']([^\"\']+)", re.IGNORECASE)
+
+        for artifact in artifacts:
+            if artifact.kind != "html_page" or artifact.path.startswith("/_flow/"):
+                continue
+            body_text = artifact.body_bytes.decode("utf-8", errors="replace")
+            for form_tag in form_tag_re.findall(body_text):
+                method_match = method_re.search(form_tag)
+                method = method_match.group(1).strip().upper() if method_match else "GET"
+                if method != "POST":
+                    continue
+                action_match = action_re.search(form_tag)
+                action = action_match.group(1).strip() if action_match else artifact.path
+                if not action or _is_external_reference(action):
+                    continue
+                normalized = normalize_path(action, index_page=request.index_page)
+                if normalized == target_path:
+                    return artifact
+        return None
+
+
+    @staticmethod
+    def _build_post_locked_variant_artifact(source: GeneratedArtifact, variant_path: str) -> GeneratedArtifact:
+        body_text = source.body_bytes.decode("utf-8", errors="replace")
+        marker = (
+            '<div class="message warning" role="alert">'
+            'Too many invalid login attempts. Please wait 1 minute before trying again.'
+            '</div>'
+        )
+
+        if "<form" in body_text:
+            updated = body_text.replace("<form", marker + "\n<form", 1)
+        elif "</body>" in body_text:
+            updated = body_text.replace("</body>", marker + "\n</body>", 1)
+        else:
+            updated = body_text + "\n" + marker
+
+        return GeneratedArtifact(
+            path=variant_path,
+            kind=source.kind,
+            headers=list(source.headers),
+            body_bytes=updated.encode("utf-8"),
+            status_code=200,
+            source_artifact_id="flow-synthesized:{}".format(source.source_artifact_id),
+            artifact_scope=source.artifact_scope,
+        )
+
+    @staticmethod
+    def _build_post_fail_variant_artifact(source: GeneratedArtifact, variant_path: str) -> GeneratedArtifact:
+        body_text = source.body_bytes.decode("utf-8", errors="replace")
+        marker = (
+            '<div class="message error" role="alert">'
+            'Authentication failed. Please verify your credentials and try again.'
+            '</div>'
+        )
+
+        if "<form" in body_text:
+            updated = body_text.replace("<form", marker + "\n<form", 1)
+        elif "</body>" in body_text:
+            updated = body_text.replace("</body>", marker + "\n</body>", 1)
+        else:
+            updated = body_text + "\n" + marker
+
+        return GeneratedArtifact(
+            path=variant_path,
+            kind=source.kind,
+            headers=list(source.headers),
+            body_bytes=updated.encode("utf-8"),
+            status_code=200,
+            source_artifact_id="flow-synthesized:{}".format(source.source_artifact_id),
+            artifact_scope=source.artifact_scope,
+        )
+
+    @staticmethod
+    def _path_to_slug(path: str) -> str:
+        """Derive a flow variant slug from a public path."""
+        slug = path.lstrip("/")
+        for ext in (".php", ".html", ".htm", ".asp", ".aspx", ".jsp", ".py"):
+            if slug.endswith(ext):
+                slug = slug[: -len(ext)]
+                break
+        slug = slug.replace("/", "-").rstrip("-") or "index"
+        return slug
+
+    def _variant_to_rule(
+        self,
+        parent_path: str,
+        variant_name: str,
+        artifact_path: str,
+        all_paths: set,
+    ) -> "FlowRule | None":
+        """Map a /_flow/ variant name to the corresponding FlowRule."""
+        if variant_name == "post-fail":
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(method="POST"),
+                response=FlowResponse(artifact_path=artifact_path, status_code=200),
+                priority=5,
+            )
+        if variant_name == "post-locked":
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(
+                    method="POST",
+                    min_prior_post_count_to_path=3,
+                    lockout_window_seconds=60,
+                    lockout_active=True,
+                ),
+                response=FlowResponse(artifact_path=artifact_path, status_code=200),
+                priority=10,  # checked before post-fail
+            )
+        if variant_name == "no-auth":
+            login_path = next((p for p in sorted(all_paths) if self._is_login_path(p)), "/")
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(missing_cookie="session_token"),
+                response=FlowResponse(redirect_to=login_path, status_code=302),
+                priority=10,
+            )
+        if variant_name == "post-success":
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(method="POST"),
+                response=FlowResponse(
+                    redirect_to=parent_path,
+                    status_code=302,
+                    set_cookie={"session_token": "granted"},
+                ),
+                priority=3,
+            )
+        if variant_name == "logout":
+            return FlowRule(
+                match_path=parent_path,
+                condition=None,
+                response=FlowResponse(
+                    redirect_to="/",
+                    status_code=302,
+                    clear_cookie=["session_token"],
+                ),
+                priority=5,
+            )
+        return None
+
+    @staticmethod
+    def _is_login_path(path: str) -> bool:
+        if path.startswith("/_flow/"):
+            return False
+        lowered = path.lower()
+        if lowered.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".otf")):
+            return False
+        return bool(AgenticBundleGenerator._LOGIN_PATH_HINT_RE.search(lowered))
+
+    @staticmethod
+    def _is_form_handler_path(path: str) -> bool:
+        if path.startswith("/_flow/"):
+            return False
+        lowered = path.lower()
+        return any(
+            hint in lowered
+            for hint in (
+                "formlogin",
+                "form-login",
+                "login.cgi",
+                "loginform",
+                "login_submit",
+                "submitlogin",
+                "checklogin",
+                "auth.cgi",
+            )
+        )
+
+    @staticmethod
+    def _is_gated_path(path: str) -> bool:
+        if path.startswith("/_flow/"):
+            return False
+        lower = path.lower()
+        return any(kw in lower for kw in ("admin", "dashboard", "portal", "panel", "control", "manage"))
 
     async def generate_bundle(self, host, path, site_profile):
         request = ensure_generation_request(host, path, site_profile if isinstance(site_profile, dict) else {})

@@ -463,6 +463,10 @@ services:
     tmpfs:
       - /tmp/tanner:uid=65534,gid=65534
       - /var/log/tanner:uid=65534,gid=65534
+    environment:
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
     command: ["/opt/tanner/tanner-env/bin/tannerapi", "--config", "/opt/tanner/runtime-config/config.yaml"]
     volumes:
       - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
@@ -484,6 +488,10 @@ services:
     tmpfs:
       - /tmp/tanner:uid=65534,gid=65534
       - /var/log/tanner:uid=65534,gid=65534
+    environment:
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
     ports:
       - '127.0.0.1:${WEB_PORT}:8091'
     command: ["/opt/tanner/tanner-env/bin/tannerweb", "--config", "/opt/tanner/runtime-config/config.yaml"]
@@ -509,9 +517,16 @@ services:
       - /tmp/tanner:uid=65534,gid=65534
       - /var/log/tanner:uid=65534,gid=65534
       - /opt/tanner/files:uid=65534,gid=65534
-    command: ["/opt/tanner/tanner-env/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
+    environment:
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      PYTHONPATH: "/opt/tanner-src"
+    working_dir: /opt/tanner-src
+    command: ["/opt/tanner/tanner-env/bin/python", "/opt/tanner-src/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
     volumes:
       - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
+      - '${ROOT_DIR}/tanner/tanner:/opt/tanner/tanner:ro'
       - '/var/run/docker.sock:/var/run/docker.sock'
     depends_on:
       - tanner_api
@@ -556,8 +571,10 @@ ${ports_block%$'\n'}
       - TANNER=tanner
       - PAGE_URL=${PAGE_URL}
       - PORT=80
+      - PYTHONPATH=/
     volumes:
       - '${STATE_DIR}:/opt/snare'
+      - '${ROOT_DIR}/snare/snare:/snare:ro'
 
 networks:
   local:
@@ -723,6 +740,13 @@ start_run() {
 
   prepare_run_dirs
   seed_snare_state
+
+  if [[ "${MODE}" == "agentic" ]]; then
+    export OPENAI_BASE_URL="http://172.25.0.1:8317/v1"
+    export OPENAI_API_BASE="http://172.25.0.1:8317/v1"
+    export OPENAI_API_KEY="sk-mor5R6MlcggVCit9qS3XzjqjW4Egc9PCOyZuWZYy1qUrf"
+  fi
+
   write_tanner_config "$MODE"
   write_tanner_compose
   write_snare_compose
@@ -736,6 +760,7 @@ start_run() {
   echo "[info] tcpdump filter: ${TCPDUMP_FILTER}"
 
   ensure_cliproxy_for_agentic
+
 
   run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans
   run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" down --remove-orphans

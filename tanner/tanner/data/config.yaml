@@ -34,7 +34,10 @@ REDIS:
 
 GENERATOR:
   backend: agentic
+  enable_scripted_flows: false  # set to true for V2 scripted flows
   max_review_loops: 1
+  max_design_validation_loops: 2
+  allow_fallback_persistence: false
   max_bundle_artifacts: 5
   max_bundle_bytes: 262144
   checkpoint_path: /tmp/tanner/tanner-agentic-checkpoints.sqlite
@@ -56,7 +59,7 @@ GENERATOR:
   meta_policy_pending_ttl_seconds: 600
   role_defaults:
     provider: openai
-    model: gpt-4.1-mini
+    model: gpt-5.4
     temperature: 0.2
     max_tokens: 900
     timeout: 120

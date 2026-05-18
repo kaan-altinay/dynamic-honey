@@ -328,11 +328,72 @@ class GeneratedArtifact(ModelBase):
     artifact_scope: ArtifactScope = "static_file"
 
 
+
+
+# ─── V2: Flow Descriptor Models ──────────────────────────────────────────────
+
+class FlowCondition(ModelBase):
+    """Conditions evaluated against live session state to decide if a rule fires.
+
+    For credential/setup/admin forms, use method="POST" rules on the form action
+    itself.  Cookie/history guards are for protected pages, not a substitute for
+    POST failure handling.  When a form supports repeated invalid submissions,
+    encode the cooldown explicitly with min_prior_post_count_to_path,
+    lockout_window_seconds, and lockout_active.
+    """
+    requires_cookie: str | None = None            # cookie key must be present
+    missing_cookie: str | None = None             # cookie key must be absent
+    requires_prev_path: str | None = None         # last path in history must match
+    method: str | None = None                     # HTTP method (GET / POST / ...)
+    min_post_count_to_path: int | None = None     # floor for lockout simulation
+    min_prior_post_count_to_path: int | None = None  # prior POSTs before current request
+    lockout_window_seconds: int | None = None     # cooldown duration after threshold
+    lockout_active: bool | None = None            # require active/inactive cooldown state
+
+
+class FlowResponse(ModelBase):
+    """Action taken when a flow rule matches.
+
+    artifact_path means rewrite and serve a concrete generated artifact.  For
+    invalid credential submissions prefer an artifact_path that visibly contains
+    failure feedback over a bare redirect back to the original form.  redirect_to
+    is appropriate for protected-page guards, logout, and success transitions.
+    """
+    artifact_path: str | None = None              # rewrite: serve this meta key
+    redirect_to: str | None = None                # synthetic 302 Location
+    status_code: int = 200
+    set_cookie: dict[str, str] = Field(default_factory=dict)
+    clear_cookie: list[str] = Field(default_factory=list)
+    headers: list[dict[str, str]] = Field(default_factory=list)
+
+
+class FlowRule(ModelBase):
+    """Single conditional routing rule; higher priority is evaluated first."""
+    match_path: str
+    condition: FlowCondition | None = None        # None = always matches this path
+    response: FlowResponse
+    priority: int = 0
+
+
+class FlowDescriptor(ModelBase):
+    """Complete scripted-flow specification for a generated V2 bundle.
+
+    A credential/setup/admin form descriptor must be behaviorally executable,
+    not just syntactically valid: every POST form action needs a POST-specific
+    failure artifact for the first three invalid submissions, followed by a
+    one-minute lockout artifact for later POSTs during the cooldown window.
+    After the cooldown elapses, the same three-attempt loop begins again.
+    Missing-cookie redirects alone are insufficient for form handlers because
+    they hide the invalid-credential state from the client.
+    """
+    rules: list[FlowRule]
+
 class GeneratedBundle(ModelBase):
     primary_path: str
     artifacts: list[GeneratedArtifact]
     review_summary: str
     used_fallback: bool = False
+    flow_descriptor: FlowDescriptor | None = None
 
 
 class StructuredReviewDecision(ModelBase):
@@ -358,7 +419,10 @@ class GeneratorRoleConfig(ModelBase):
 
 class GeneratorRuntimeConfig(ModelBase):
     backend: str = "agentic"
+    enable_scripted_flows: bool = False
     max_review_loops: int = Field(default=2, ge=1)
+    max_design_validation_loops: int = Field(default=2, ge=1)
+    allow_fallback_persistence: bool = False
     max_bundle_artifacts: int = Field(default=4, ge=1)
     max_bundle_bytes: int = Field(default=262_144, ge=1024)
     checkpoint_path: str = "/tmp/tanner-agentic-checkpoints.sqlite"

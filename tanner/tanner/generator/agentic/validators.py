@@ -37,6 +37,13 @@ _BINARY_ASSET_EXTENSIONS = (
     ".ttf",
     ".otf",
 )
+_LOGIN_PATH_RE = re.compile(
+    r"(?:^|/)(?:wp-login|login|logon|signin|sign-in|auth|account|session|formlogin|form-login)(?:$|[/?._-])",
+    re.IGNORECASE,
+ )
+_FORM_TAG_RE = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
+_FORM_METHOD_RE = re.compile(r"\bmethod\s*=\s*[\"\']?([^\"\'\s>]+)", re.IGNORECASE)
+_FORM_ACTION_RE = re.compile(r"\baction\s*=\s*[\"\']([^\"\']+)", re.IGNORECASE)
 
 
 class ValidationError(ValueError):
@@ -96,10 +103,132 @@ def _has_config_theft_support(artifacts, primary_path: str) -> bool:
     return False
 
 
-def _is_cms_login_html_path(path: str) -> bool:
+def _is_form_handler_like_path(path: str) -> bool:
     lowered = path.lower()
-    return lowered == "/wp-login.php" or (lowered.startswith("/wp-admin/") and "login" in lowered)
+    if lowered.startswith("/_flow/"):
+        return False
+    if lowered.endswith(_BINARY_ASSET_EXTENSIONS):
+        return False
+    return any(
+        hint in lowered
+        for hint in (
+            "formlogin",
+            "form-login",
+            "login.cgi",
+            "loginform",
+            "login_submit",
+            "submitlogin",
+            "checklogin",
+            "auth.cgi",
+        )
+    )
 
+
+def _is_login_like_path(path: str) -> bool:
+    lowered = path.lower()
+    if lowered.startswith("/_flow/"):
+        return False
+    if lowered.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".otf")):
+        return False
+    return bool(_LOGIN_PATH_RE.search(lowered))
+
+
+def _collect_login_post_targets(bundle: GeneratedBundle, request: GenerationRequest) -> set[str]:
+    targets: set[str] = set()
+    for artifact in bundle.artifacts:
+        if artifact.kind != "html_page" or artifact.path.startswith("/_flow/"):
+            continue
+        body_text = artifact.body_bytes.decode("utf-8", errors="replace")
+        for form_tag in _FORM_TAG_RE.findall(body_text):
+            method_match = _FORM_METHOD_RE.search(form_tag)
+            method = method_match.group(1).strip().upper() if method_match else "GET"
+            if method != "POST":
+                continue
+            action_match = _FORM_ACTION_RE.search(form_tag)
+            action = action_match.group(1).strip() if action_match else artifact.path
+            if not action or _is_external_reference(action):
+                continue
+            normalized = normalize_path(action, index_page=request.index_page)
+            targets.add(normalized)
+    return targets
+
+
+_FLOW_FAILURE_FEEDBACK_RE = re.compile(
+    r"\b(invalid|incorrect|wrong|failed|failure|denied|unauthorized|try again|password is error|credential)\b",
+    re.IGNORECASE,
+)
+_LOCKOUT_FEEDBACK_RE = re.compile(
+    r"\b(too many|locked|lockout|wait 1 minute|wait one minute|try again later|temporarily blocked|too many invalid)\b",
+    re.IGNORECASE,
+)
+
+
+def _artifact_has_failure_feedback(artifact: GeneratedArtifact | None) -> bool:
+    if artifact is None:
+        return False
+    body_text = artifact.body_bytes.decode("utf-8", errors="replace")
+    return bool(_FLOW_FAILURE_FEEDBACK_RE.search(body_text))
+
+
+def _artifact_has_lockout_feedback(artifact: GeneratedArtifact | None) -> bool:
+    if artifact is None:
+        return False
+    body_text = artifact.body_bytes.decode("utf-8", errors="replace")
+    return bool(_LOCKOUT_FEEDBACK_RE.search(body_text))
+
+
+def _validate_login_flow_rules(descriptor, login_targets: set[str], artifact_by_path: dict[str, GeneratedArtifact]) -> None:
+    for target in sorted(login_targets):
+        post_rules = [
+            rule
+            for rule in descriptor.rules
+            if normalize_path(rule.match_path) == target
+            and rule.condition is not None
+            and (rule.condition.method or "").upper() == "POST"
+        ]
+        if not post_rules:
+            raise ValidationError(
+                "login-like POST target {} requires at least one POST flow rule".format(target)
+            )
+        artifact_post_rules = [rule for rule in post_rules if rule.response.artifact_path]
+        if not artifact_post_rules:
+            raise ValidationError(
+                "form POST target {} requires at least one POST flow rule with artifact_path".format(target)
+            )
+        if not any(
+            _artifact_has_failure_feedback(artifact_by_path.get(rule.response.artifact_path))
+            for rule in artifact_post_rules
+        ):
+            raise ValidationError(
+                "form POST target {} requires a POST artifact response with visible invalid-credential feedback".format(target)
+            )
+        lockout_rules = [
+            rule
+            for rule in artifact_post_rules
+            if rule.condition is not None
+            and rule.condition.lockout_active is True
+            and rule.condition.lockout_window_seconds == 60
+            and rule.condition.min_prior_post_count_to_path == 3
+        ]
+        if not lockout_rules:
+            raise ValidationError(
+                "form POST target {} requires a one-minute lockout artifact after three prior invalid attempts".format(target)
+            )
+        if not any(
+            _artifact_has_lockout_feedback(artifact_by_path.get(rule.response.artifact_path))
+            for rule in lockout_rules
+        ):
+            raise ValidationError(
+                "form POST target {} requires a visible too-many-attempts lockout artifact".format(target)
+            )
+        distinct_outcomes = {
+            (rule.response.artifact_path, rule.response.redirect_to, rule.response.status_code)
+            for rule in post_rules
+        }
+        if len(distinct_outcomes) < 2:
+            raise ValidationError(
+                "form POST target {} requires at least two distinct POST flow outcomes".format(target)
+            )
 
 def _required_primary_kind_for_path(path: str) -> str | None:
     lowered = path.lower()
@@ -157,6 +286,10 @@ def _content_type_matches(actual: str | None, expected: str | None) -> bool:
         return True
     if normalized_actual == normalized_expected:
         return True
+    # Allow vendor-specific JSON media types such as Spring Boot actuator responses.
+    if normalized_expected == "application/json" and isinstance(normalized_actual, str):
+        if normalized_actual.endswith("+json"):
+            return True
     # Allow SOAP/XML media types on endpoints that otherwise accept XML.
     if normalized_expected == "application/xml" and normalized_actual in {"application/soap+xml", "text/xml"}:
         return True
@@ -197,6 +330,15 @@ def _expected_content_type_for_kind_and_path(kind: str, path: str) -> str | None
         "binary_asset": _binary_content_type_for_path(path),
     }
     kind_expected = kind_expected_map.get(kind)
+    kind_overrides_extension = {
+        "credential_bait",
+        "config_text",
+        "log_excerpt",
+        "backup_manifest",
+        "plain_text",
+    }
+    if kind in kind_overrides_extension:
+        return kind_expected
     return extension_expected or kind_expected
 
 
@@ -300,8 +442,8 @@ def _validate_local_reference(
 
 
 def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config: GeneratorRuntimeConfig) -> None:
-    if not plan.static_only:
-        raise ValidationError("plan must remain static-only in v1")
+    if not plan.static_only and not runtime_config.enable_scripted_flows:
+        raise ValidationError("plan must remain static-only unless scripted flows are enabled")
 
     planned_output_count = _planned_output_count(plan)
     if planned_output_count > runtime_config.max_bundle_artifacts:
@@ -355,7 +497,11 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
             )
     artifact_id_set = set(artifact_ids)
     for artifact in plan.artifacts:
-        validate_planned_artifact(artifact, request)
+        validate_planned_artifact(
+            artifact,
+            request,
+            allow_non_static_scopes=runtime_config.enable_scripted_flows,
+        )
         unknown_dependencies = [dependency for dependency in artifact.depends_on if dependency not in artifact_id_set]
         if unknown_dependencies:
             raise ValidationError(
@@ -388,7 +534,7 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
         cms_login_html_artifacts = [
             artifact
             for artifact in plan.artifacts
-            if artifact.kind == "html_page" and _is_cms_login_html_path(artifact.path)
+            if artifact.kind == "html_page" and _is_login_like_path(artifact.path)
         ]
         if cms_login_html_artifacts and not stylesheet_paths:
             raise ValidationError(
@@ -410,8 +556,16 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
         raise ValidationError("plan must include at least 2 generated artifacts for bundle coherence")
 
 
-def validate_planned_artifact(artifact: PlannedArtifact, request: GenerationRequest) -> None:
-    if artifact.artifact_scope != "static_file":
+def validate_planned_artifact(
+    artifact: PlannedArtifact,
+    request: GenerationRequest,
+    *,
+    allow_non_static_scopes: bool = False,
+) -> None:
+    allowed_scopes = {"static_file"}
+    if allow_non_static_scopes:
+        allowed_scopes.update({"dynamic_endpoint", "service_stub"})
+    if artifact.artifact_scope not in allowed_scopes:
         raise ValidationError("unsupported artifact scope {}".format(artifact.artifact_scope))
     if artifact.kind == "asset_file":
         raise ValidationError(
@@ -621,11 +775,19 @@ def validate_artifact_draft_contract(
                 )
 
 
-def validate_generated_artifact(artifact: GeneratedArtifact, request: GenerationRequest) -> None:
+def validate_generated_artifact(
+    artifact: GeneratedArtifact,
+    request: GenerationRequest,
+    *,
+    allow_non_static_scopes: bool = False,
+) -> None:
     if normalize_path(artifact.path, index_page=request.index_page) != artifact.path:
         raise ValidationError("generated artifact path is not normalized: {}".format(artifact.path))
-    if artifact.artifact_scope != "static_file":
-        raise ValidationError("generated artifact is not static")
+    allowed_scopes = {"static_file"}
+    if allow_non_static_scopes:
+        allowed_scopes.update({"dynamic_endpoint", "service_stub"})
+    if artifact.artifact_scope not in allowed_scopes:
+        raise ValidationError("generated artifact scope {} is unsupported".format(artifact.artifact_scope))
     if artifact.status_code < 100 or artifact.status_code > 599:
         raise ValidationError("generated artifact status code is out of range")
     if not artifact.body_bytes:
@@ -715,6 +877,42 @@ def _validate_bundle_reference(
         )
 
 
+
+
+def validate_flow_descriptor(descriptor, bundle_paths: set) -> None:
+    """
+    Check a FlowDescriptor for consistency against the artifact paths in a bundle.
+
+    Raises ValidationError if:
+    - Any rule references an artifact_path not present in the bundle
+    - A rule has neither artifact_path nor redirect_to
+    - A redirect_to is not a valid normalised path
+    - A cookie name is empty
+    """
+    for rule in descriptor.rules:
+        resp = rule.response
+        if resp.artifact_path is None and resp.redirect_to is None:
+            raise ValidationError(
+                "flow rule for {!r} has neither artifact_path nor redirect_to".format(rule.match_path)
+            )
+        if resp.artifact_path is not None and resp.artifact_path not in bundle_paths:
+            raise ValidationError(
+                "flow rule references artifact {!r} which is not in the bundle".format(resp.artifact_path)
+            )
+        if resp.redirect_to is not None:
+            try:
+                normalize_path(resp.redirect_to)
+            except Exception:
+                raise ValidationError(
+                    "flow rule redirect_to {!r} is not a valid path".format(resp.redirect_to)
+                )
+        for name in resp.set_cookie:
+            if not name:
+                raise ValidationError("flow rule set_cookie contains an empty cookie name")
+        for name in resp.clear_cookie:
+            if not name:
+                raise ValidationError("flow rule clear_cookie contains an empty cookie name")
+
 def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime_config: GeneratorRuntimeConfig) -> None:
     normalized_primary = normalize_path(bundle.primary_path, index_page=request.index_page)
     if normalized_primary != request.normalized_path:
@@ -727,8 +925,13 @@ def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime
 
     total_bytes = 0
     available_paths = set()
+    artifact_by_path = {artifact.path: artifact for artifact in bundle.artifacts}
     for artifact in bundle.artifacts:
-        validate_generated_artifact(artifact, request)
+        validate_generated_artifact(
+            artifact,
+            request,
+            allow_non_static_scopes=runtime_config.enable_scripted_flows,
+        )
         total_bytes += len(artifact.body_bytes)
         available_paths.add(artifact.path)
 
@@ -737,7 +940,7 @@ def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime
 
     if request.normalized_path not in available_paths:
         raise ValidationError("bundle is missing the primary requested artifact")
-
+    flow_descriptor = getattr(bundle, "flow_descriptor", None)
     required_primary_kind = _required_primary_kind_for_path(request.normalized_path)
     if required_primary_kind is not None:
         primary_artifact = next((artifact for artifact in bundle.artifacts if artifact.path == request.normalized_path), None)
@@ -752,6 +955,32 @@ def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime
                 )
             )
     allowed_paths = available_paths | _allowed_baseline_paths(request)
+
+    login_post_targets = _collect_login_post_targets(bundle, request)
+    if login_post_targets and runtime_config.enable_scripted_flows:
+        if flow_descriptor is None:
+            raise ValidationError(
+                "POST forms require a flow descriptor with a three-attempt failure loop and one-minute lockout"
+            )
+        validate_flow_descriptor(flow_descriptor, available_paths)
+        _validate_login_flow_rules(flow_descriptor, login_post_targets, artifact_by_path)
+    elif flow_descriptor is not None:
+        validate_flow_descriptor(flow_descriptor, available_paths)
+
+    if flow_descriptor is not None:
+        for rule in flow_descriptor.rules:
+            redirect_to = rule.response.redirect_to
+            if redirect_to is None:
+                continue
+            normalized_redirect = normalize_path(redirect_to, index_page=request.index_page)
+            if normalized_redirect not in allowed_paths:
+                raise ValidationError(
+                    "flow rule redirect_to {!r} references missing path {}".format(
+                        redirect_to,
+                        normalized_redirect,
+                    )
+                )
+
     for artifact in bundle.artifacts:
         if artifact.kind == "html_page":
             for reference in extract_html_references(artifact.body_bytes):
