@@ -38,15 +38,22 @@ GENERATOR:
   max_review_loops: 1
   max_design_validation_loops: 2
   allow_fallback_persistence: false
-  max_bundle_artifacts: 5
-  max_bundle_bytes: 262144
+  max_bundle_artifacts: 8
+  max_bundle_bytes: 2000000
   checkpoint_path: /tmp/tanner/tanner-agentic-checkpoints.sqlite
   graph_recursion_limit: 200
   review_log_path: /tmp/tanner/tanner-agentic-review-log.json
-  enable_live_research: False
+  enable_live_research: True
   max_tool_response_chars: 4000
-  max_command_output_chars: 4000
-  command_timeout: 5
+  max_command_output_chars: 2000
+  command_timeout: 2
+  max_concurrent_model_calls: 1
+  inter_call_delay_seconds: 12.5
+  max_rate_limit_retries: 3
+  default_rate_limit_backoff_seconds: 12.0
+  max_length_limit_retries: 3
+  length_retry_token_increase: 800
+  max_length_retry_tokens: 6000
   meta_policy_enabled: True
   meta_policy_min_distinct_ips: 2
   meta_policy_min_recent_hits: 3
@@ -63,20 +70,20 @@ GENERATOR:
     temperature: 0.2
     max_tokens: 900
     timeout: 120
-    max_retries: 2
+    max_retries: 1
   roles:
     expert:
-      temperature: 0.1
-      max_tokens: 900
+      temperature: 0.0
+      max_tokens: 1800
     design:
-      temperature: 0.2
-      max_tokens: 900
+      temperature: 0.0
+      max_tokens: 2800
     coder:
-      temperature: 0.35
-      max_tokens: 1000
+      temperature: 0.1
+      max_tokens: 1600
     review:
-      temperature: 0.05
-      max_tokens: 700
+      temperature: 0.0
+      max_tokens: 1600
 
 EMULATORS:
   root_dir: /opt/tanner

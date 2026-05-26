@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
 from tanner.generator.agentic.models import FlowDescriptor, FlowRule
@@ -86,7 +87,7 @@ class FlowEvaluator:
         all_rules.sort(key=lambda r: r.priority, reverse=True)
 
         for rule in all_rules:
-            if self._rule_matches(rule, path, method, session):
+            if self._rule_matches(rule, path, method, session, data):
                 return self._build_result(rule)
 
         return FlowMatchResult(matched=False)
@@ -94,7 +95,7 @@ class FlowEvaluator:
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _rule_matches(
-        self, rule: FlowRule, path: str, method: str, session: Any
+        self, rule: FlowRule, path: str, method: str, session: Any, data: dict
     ) -> bool:
         if rule.match_path != path:
             return False
@@ -115,6 +116,43 @@ class FlowEvaluator:
             if cond.missing_cookie in session.cookies:
                 return False
 
+
+        headers = self._headers_from_data(data)
+        query = self._query_from_data(data)
+        post_data = self._post_from_data(data)
+
+        if cond.requires_header is not None:
+            if cond.requires_header.lower() not in headers:
+                return False
+        if cond.missing_header is not None:
+            if cond.missing_header.lower() in headers:
+                return False
+        for name, expected in cond.header_equals.items():
+            if headers.get(name.lower()) != expected:
+                return False
+        for name, expected_substring in cond.header_contains.items():
+            if expected_substring.lower() not in headers.get(name.lower(), "").lower():
+                return False
+
+        for name in cond.query_has:
+            if name not in query:
+                return False
+        for name, expected in cond.query_equals.items():
+            if expected not in query.get(name, []):
+                return False
+        for name, expected_substring in cond.query_contains.items():
+            if not any(expected_substring.lower() in value.lower() for value in query.get(name, [])):
+                return False
+
+        for name in cond.post_has:
+            if name not in post_data:
+                return False
+        for name, expected in cond.post_equals.items():
+            if post_data.get(name) != expected:
+                return False
+        for name, expected_substring in cond.post_contains.items():
+            if expected_substring.lower() not in post_data.get(name, "").lower():
+                return False
         # Previous path check (exclude current request already appended by session_manager)
         if cond.requires_prev_path is not None:
             history = [e["path"].split("?")[0] for e in session.paths]
@@ -146,6 +184,27 @@ class FlowEvaluator:
                 return False
 
         return True
+
+    @staticmethod
+    def _headers_from_data(data: dict) -> dict[str, str]:
+        headers = data.get("headers") if isinstance(data, dict) else {}
+        if not isinstance(headers, dict):
+            return {}
+        return {str(key).lower(): str(value) for key, value in headers.items()}
+
+    @staticmethod
+    def _query_from_data(data: dict) -> dict[str, list[str]]:
+        raw_path = data.get("path") if isinstance(data, dict) else ""
+        if not isinstance(raw_path, str):
+            return {}
+        return parse_qs(urlsplit(raw_path).query, keep_blank_values=True)
+
+    @staticmethod
+    def _post_from_data(data: dict) -> dict[str, str]:
+        post_data = data.get("post_data") if isinstance(data, dict) else {}
+        if not isinstance(post_data, dict):
+            return {}
+        return {str(key): str(value) for key, value in post_data.items()}
 
     @staticmethod
     def _post_history(session: Any, path: str) -> tuple[float, list[float]]:

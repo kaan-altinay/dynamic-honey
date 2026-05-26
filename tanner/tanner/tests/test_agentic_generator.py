@@ -77,6 +77,56 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         values.update(overrides)
         return GeneratorRuntimeConfig.model_validate(values)
 
+
+    def test_v2_intent_routing_is_gated_by_scripted_flows(self):
+        v1_generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=False))
+        v2_generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+
+        v1_container = self.loop.run_until_complete(
+            v1_generator._heuristic_expert_spec(
+                ensure_generation_request("example.com", "/containers/json", {"index_page": "/index.html"})
+            )
+        )
+        v2_container = self.loop.run_until_complete(
+            v2_generator._heuristic_expert_spec(
+                ensure_generation_request("example.com", "/containers/json", {"index_page": "/index.html"})
+            )
+        )
+        v1_secret = self.loop.run_until_complete(
+            v1_generator._heuristic_expert_spec(
+                ensure_generation_request("example.com", "/.env", {"index_page": "/index.html"})
+            )
+        )
+        v2_secret = self.loop.run_until_complete(
+            v2_generator._heuristic_expert_spec(
+                ensure_generation_request("example.com", "/.env", {"index_page": "/index.html"})
+            )
+        )
+
+        self.assertEqual(v1_container.intent_family, "generic_recon")
+        self.assertEqual(v2_container.intent_family, "container_api")
+        self.assertEqual(v1_secret.intent_family, "config_theft")
+        self.assertEqual(v2_secret.intent_family, "config_secret")
+
+    def test_v2_intent_routing_covers_endpoint_families(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+        cases = {
+            "/wp-login.php": "auth_portal",
+            "/boaform/admin/formLogin": "network_device",
+            "/api/v1/pods": "kubernetes_api",
+            "/_nodes": "elastic_api",
+            "/solr/admin/cores": "solr_api",
+            "/shell": "webshell_probe",
+        }
+
+        for path, expected_intent in cases.items():
+            with self.subTest(path=path):
+                spec = self.loop.run_until_complete(
+                    generator._heuristic_expert_spec(
+                        ensure_generation_request("example.com", path, {"index_page": "/index.html"})
+                    )
+                )
+                self.assertEqual(spec.intent_family, expected_intent)
     def test_generate_bundle_for_wp_admin_includes_contextual_assets(self):
         generator = NoModelGenerator(runtime_config=self._runtime_config())
 
@@ -1125,6 +1175,8 @@ class TestAgenticBundleGenerator(unittest.TestCase):
 
         result = self.loop.run_until_complete(generator._flow_designer_node(state))
         descriptor = FlowDescriptor.model_validate(result["flow_descriptor"])
+        result_bundle = GeneratedBundle.model_validate(result["generated_bundle"])
+        self.assertIsNotNone(result_bundle.flow_descriptor)
 
         self.assertFalse(
             any(
@@ -1134,6 +1186,232 @@ class TestAgenticBundleGenerator(unittest.TestCase):
                 for rule in descriptor.rules
             )
         )
+
+    def test_flow_designer_output_validates_before_review(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+        request = ensure_generation_request(
+            "example.com",
+            "/boaform/admin/formLogin",
+            {"index_page": "/index.html"},
+        )
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = ResourcePlan(
+            primary_path="/boaform/admin/formLogin",
+            theme_summary="Legacy router admin portal",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login-page",
+                    path="/admin/login.asp",
+                    kind="html_page",
+                    purpose="Login page",
+                    dynamic_candidate=True,
+                ),
+                PlannedArtifact(
+                    artifact_id="login-handler",
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    purpose="Form handler",
+                    artifact_scope="dynamic_endpoint",
+                    dynamic_candidate=True,
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16384,
+            static_only=False,
+            review_focus=["flow"],
+        )
+        bundle = GeneratedBundle(
+            primary_path="/boaform/admin/formLogin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin/login.asp",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=(
+                        b'<html><body><form method="post" action="/boaform/admin/formLogin">'
+                        b'<input name="username"><input name="password" type="password">'
+                        b'</form></body></html>'
+                    ),
+                    status_code=200,
+                    source_artifact_id="login-page",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/boaform/admin/formLogin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><body>handler</body></html>',
+                    status_code=200,
+                    source_artifact_id="login-handler",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+        state = {
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "generated_bundle": bundle.model_dump(mode="json"),
+            "errors": [],
+        }
+
+        flow_result = self.loop.run_until_complete(generator._flow_designer_node(state))
+        review_result = self.loop.run_until_complete(
+            generator._review_node({**state, **flow_result})
+        )
+
+        self.assertEqual(review_result["review_decision"].decision, "approve")
+
+    def test_optional_first_class_flow_variants_map_to_rules(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+
+        mfa_rule = generator._variant_to_rule(
+            "/admin/login",
+            "mfa-required",
+            "/_flow/admin-login/mfa-required",
+            {"/admin/login", "/_flow/admin-login/mfa-required"},
+        )
+        expired_rule = generator._variant_to_rule(
+            "/admin/panel",
+            "session-expired",
+            "/_flow/admin-panel/session-expired",
+            {"/admin/panel", "/_flow/admin-panel/session-expired"},
+        )
+
+        self.assertEqual(mfa_rule.condition.method, "POST")
+        self.assertEqual(mfa_rule.response.artifact_path, "/_flow/admin-login/mfa-required")
+        self.assertEqual(mfa_rule.response.set_cookie, {"session_stage": "mfa_required"})
+        self.assertEqual(expired_rule.condition.missing_cookie, "session_token")
+        self.assertEqual(expired_rule.response.artifact_path, "/_flow/admin-panel/session-expired")
+
+    def test_explicit_flow_metadata_builds_non_login_rule(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True))
+        request = ensure_generation_request(
+            "example.com",
+            "/manager/html",
+            {"index_page": "/index.html"},
+        )
+        resource_plan = ResourcePlan(
+            primary_path="/manager/html",
+            theme_summary="Management console",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="manager-page",
+                    path="/manager/html",
+                    kind="html_page",
+                    purpose="Management console landing page",
+                ),
+                PlannedArtifact(
+                    artifact_id="manager-auth-required",
+                    path="/_flow/manager-html/auth-required",
+                    kind="html_page",
+                    purpose="Authorization required response for missing credentials",
+                    flow_match_path="/manager/html",
+                    flow_condition=FlowCondition(missing_header="Authorization"),
+                    flow_response=FlowResponse(
+                        artifact_path="/_flow/manager-html/auth-required",
+                        status_code=401,
+                        headers=[{"WWW-Authenticate": "Basic realm=\"Management Console\""}],
+                    ),
+                    flow_priority=20,
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16384,
+            static_only=False,
+            coherence_facts={"service_name": "Management Console"},
+        )
+        bundle = GeneratedBundle(
+            primary_path="/manager/html",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/manager/html",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Manager</body></html>",
+                    status_code=200,
+                    source_artifact_id="manager-page",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/manager-html/auth-required",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Authorization required</body></html>",
+                    status_code=200,
+                    source_artifact_id="manager-auth-required",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        validate_plan(resource_plan, request, generator.runtime_config)
+        result = self.loop.run_until_complete(
+            generator._flow_designer_node(
+                {
+                    "request": request,
+                    "resource_plan": resource_plan,
+                    "generated_bundle": bundle.model_dump(mode="json"),
+                }
+            )
+        )
+        descriptor = FlowDescriptor.model_validate(result["flow_descriptor"])
+
+        self.assertEqual(len(descriptor.rules), 1)
+        rule = descriptor.rules[0]
+        self.assertEqual(rule.match_path, "/manager/html")
+        self.assertEqual(rule.condition.missing_header, "Authorization")
+        self.assertEqual(rule.response.status_code, 401)
+        self.assertEqual(rule.response.artifact_path, "/_flow/manager-html/auth-required")
+
+    def test_flow_evaluator_matches_headers_query_and_post_fields(self):
+        evaluator = FlowEvaluator()
+        evaluator.load_from_dict(
+            "/request-shape",
+            {
+                "rules": [
+                    {
+                        "match_path": "/manager/html",
+                        "condition": {"missing_header": "Authorization"},
+                        "response": {
+                            "artifact_path": "/_flow/manager-html/auth-required",
+                            "status_code": 401,
+                            "headers": [{"WWW-Authenticate": "Basic realm=\"Management Console\""}],
+                        },
+                        "priority": 30,
+                    },
+                    {
+                        "match_path": "/shell",
+                        "condition": {"query_has": ["cmd"], "header_contains": {"User-Agent": "curl"}},
+                        "response": {"artifact_path": "/_flow/shell/command-response", "status_code": 200},
+                        "priority": 20,
+                    },
+                    {
+                        "match_path": "/upload",
+                        "condition": {"method": "POST", "post_has": ["filename"], "post_contains": {"filename": ".php"}},
+                        "response": {"artifact_path": "/_flow/upload/upload-denied", "status_code": 403},
+                        "priority": 10,
+                    },
+                ]
+            },
+        )
+
+        class FakeSession:
+            paths = []
+            cookies = {}
+
+        auth_required = evaluator.evaluate(FakeSession(), "/manager/html", {"method": "GET", "headers": {}})
+        authorized = evaluator.evaluate(FakeSession(), "/manager/html", {"method": "GET", "headers": {"authorization": "Basic abc"}})
+        command = evaluator.evaluate(FakeSession(), "/shell", {"method": "GET", "path": "/shell?cmd=id", "headers": {"user-agent": "curl/8.0"}})
+        upload = evaluator.evaluate(FakeSession(), "/upload", {"method": "POST", "post_data": {"filename": "cmd.php"}})
+
+        self.assertEqual(auth_required.status_code, 401)
+        self.assertEqual(auth_required.headers["WWW-Authenticate"], "Basic realm=\"Management Console\"")
+        self.assertFalse(authorized.matched)
+        self.assertEqual(command.artifact_path, "/_flow/shell/command-response")
+        self.assertEqual(upload.artifact_path, "/_flow/upload/upload-denied")
 
 
     def test_flow_evaluator_enforces_three_attempt_loop_with_one_minute_lockout(self):
@@ -1197,3 +1475,219 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         self.assertEqual(third.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
         self.assertEqual(locked.artifact_path, "/_flow/boaform-admin-formLogin/post-locked")
         self.assertEqual(reset.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
+
+    # ── coherence binding table (V2-gated) ────────────────────────────────────
+
+    def test_normalize_coherence_bindings_flattens_all_value_types(self):
+        result = AgenticBundleGenerator._normalize_coherence_bindings({
+            "pod_name": "api-gateway-7c9d8f6b6b-k2r4m",
+            "replicas": 3,
+            "healthy": True,
+            "image": {"name": "registry.internal/api:v1.2.3", "tag": "v1.2.3"},
+            "ports": [8080, 443],
+            "unset": None,
+        })
+        self.assertEqual(result["pod_name"], "api-gateway-7c9d8f6b6b-k2r4m")
+        self.assertEqual(result["replicas"], "3")
+        self.assertEqual(result["healthy"], "True")
+        # nested dict serialised to compact JSON
+        self.assertIn("registry.internal/api:v1.2.3", result["image"])
+        # nested list serialised to compact JSON
+        self.assertIn("8080", result["ports"])
+        # None values omitted
+        self.assertNotIn("unset", result)
+
+    def test_fan_out_coders_threads_coherence_bindings_into_each_send(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config())
+        request = ensure_generation_request("example.com", "/api/v1/pods", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+        bindings = {"pod_name": "web-abc123", "image": "registry.internal/web:v1.0"}
+        sends = generator._fan_out_coders({
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "plan_revision": 1,
+            "coherence_bindings": bindings,
+        })
+        self.assertEqual(len(sends), len(resource_plan.artifacts))
+        for send in sends:
+            self.assertEqual(send.node, "coder_node")
+            self.assertIn("coherence_bindings", send.arg)
+            self.assertEqual(send.arg["coherence_bindings"], bindings)
+
+    def test_fan_out_coders_passes_none_bindings_when_not_in_state(self):
+        """Fan-out with no coherence_bindings key in state passes None, not KeyError."""
+        generator = NoModelGenerator(runtime_config=self._runtime_config())
+        request = ensure_generation_request("example.com", "/containers/json", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+        sends = generator._fan_out_coders({
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "plan_revision": 1,
+            # coherence_bindings intentionally absent
+        })
+        for send in sends:
+            self.assertIn("coherence_bindings", send.arg)
+            self.assertIsNone(send.arg["coherence_bindings"])
+
+    def test_coder_prompt_uses_binding_table_when_v2_and_bindings_set(self):
+        """V2: coder prompt must contain the hard BINDING TABLE block, not advisory label."""
+        captured = []
+
+        class CapturingGenerator(NoModelGenerator):
+            async def _invoke_structured(self, role_name, schema, messages):
+                if role_name == "coder":
+                    captured.append(messages)
+                raise RuntimeError("no model — fall through to heuristic")
+
+        cfg = self._runtime_config(enable_scripted_flows=True)
+        generator = CapturingGenerator(runtime_config=cfg)
+        request = ensure_generation_request("example.com", "/api/v1/pods", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+        artifact = resource_plan.artifacts[0]
+        bindings = {"cluster_name": "prod-gke-a", "pod_uid": "abc-123", "image": "registry.internal/api:v2.1"}
+
+        self.loop.run_until_complete(generator._coder_node({
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "pending_artifact": artifact,
+            "plan_revision": 1,
+            "coherence_bindings": bindings,
+        }))
+
+        self.assertTrue(captured, "expected coder to be invoked at least once")
+        user_content = captured[0][1]["content"]
+        self.assertIn("BINDING TABLE", user_content)
+        self.assertIn("cluster_name: prod-gke-a", user_content)
+        self.assertIn("image: registry.internal/api:v2.1", user_content)
+        self.assertIn("MUST reproduce these exact values", user_content)
+        # advisory label must NOT appear when V2 binding table is active
+        self.assertNotIn("Coherence facts to reuse", user_content)
+
+    def test_coder_prompt_uses_advisory_json_when_v1(self):
+        """V1 (enable_scripted_flows=False): coder prompt must use the original advisory JSON."""
+        captured = []
+
+        class CapturingGenerator(NoModelGenerator):
+            async def _invoke_structured(self, role_name, schema, messages):
+                if role_name == "coder":
+                    captured.append(messages)
+                raise RuntimeError("no model — fall through to heuristic")
+
+        cfg = self._runtime_config(enable_scripted_flows=False)
+        generator = CapturingGenerator(runtime_config=cfg)
+        request = ensure_generation_request("example.com", "/api/v1/pods", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+        resource_plan = resource_plan.model_copy(update={
+            "coherence_facts": {"cluster_name": "prod-gke-a"}
+        })
+        artifact = resource_plan.artifacts[0]
+
+        self.loop.run_until_complete(generator._coder_node({
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "pending_artifact": artifact,
+            "plan_revision": 1,
+            # No coherence_bindings — V1 reads coherence_facts from resource_plan directly
+        }))
+
+        self.assertTrue(captured)
+        user_content = captured[0][1]["content"]
+        # V1: advisory JSON value must appear; binding table must NOT
+        self.assertIn("prod-gke-a", user_content)
+        self.assertNotIn("BINDING TABLE", user_content)
+
+    def test_design_node_v2_populates_coherence_bindings_in_return(self):
+        """Design node must return coherence_bindings dict when V2 and coherence_facts non-empty."""
+        from tanner.generator.agentic.models import (
+            ResourcePlan as _RP, PlannedArtifact as _PA, ResponseContract as _RC,
+        )
+
+        class FakeDesignGenerator(NoModelGenerator):
+            async def _invoke_structured(self, role_name, schema, messages):
+                if role_name == "design":
+                    return _RP(
+                        primary_path="/api/v1/pods",
+                        theme_summary="Kubernetes API",
+                        artifacts=[_PA(
+                            artifact_id="pod-list",
+                            path="/api/v1/pods",
+                            kind="json_document",
+                            purpose="pod list",
+                            response_contract=_RC(content_type="application/json"),
+                        )],
+                        bundle_budget_count=1,
+                        bundle_budget_bytes=262144,
+                        coherence_facts={
+                            "cluster_name": "prod-gke-a",
+                            "pod_uid": "abc-def-123",
+                        },
+                    )
+                raise RuntimeError("no model")
+
+        cfg = self._runtime_config(enable_scripted_flows=True)
+        generator = FakeDesignGenerator(runtime_config=cfg)
+        request = ensure_generation_request("example.com", "/api/v1/pods", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        expert_spec = expert_spec.model_copy(update={"confidence": 0.9})
+
+        result = self.loop.run_until_complete(generator._design_node({
+            "request": request,
+            "expert_spec": expert_spec,
+            "review_feedback": [],
+            "plan_revision": 0,
+        }))
+
+        self.assertIn("coherence_bindings", result)
+        bindings = result["coherence_bindings"]
+        self.assertIsNotNone(bindings)
+        self.assertEqual(bindings["cluster_name"], "prod-gke-a")
+        self.assertEqual(bindings["pod_uid"], "abc-def-123")
+
+    def test_design_node_v1_does_not_produce_coherence_bindings(self):
+        """V1 design node must return coherence_bindings=None regardless of coherence_facts."""
+        from tanner.generator.agentic.models import (
+            ResourcePlan as _RP, PlannedArtifact as _PA, ResponseContract as _RC,
+        )
+
+        class FakeDesignGenerator(NoModelGenerator):
+            async def _invoke_structured(self, role_name, schema, messages):
+                if role_name == "design":
+                    return _RP(
+                        primary_path="/api/v1/pods",
+                        theme_summary="Kubernetes API",
+                        artifacts=[_PA(
+                            artifact_id="pod-list",
+                            path="/api/v1/pods",
+                            kind="json_document",
+                            purpose="pod list",
+                            response_contract=_RC(content_type="application/json"),
+                        )],
+                        bundle_budget_count=1,
+                        bundle_budget_bytes=262144,
+                        coherence_facts={"cluster_name": "prod-gke-a"},
+                    )
+                raise RuntimeError("no model")
+
+        cfg = self._runtime_config(enable_scripted_flows=False)
+        generator = FakeDesignGenerator(runtime_config=cfg)
+        request = ensure_generation_request("example.com", "/api/v1/pods", {})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        expert_spec = expert_spec.model_copy(update={"confidence": 0.9})
+
+        result = self.loop.run_until_complete(generator._design_node({
+            "request": request,
+            "expert_spec": expert_spec,
+            "review_feedback": [],
+            "plan_revision": 0,
+        }))
+
+        self.assertIn("coherence_bindings", result)
+        self.assertIsNone(result["coherence_bindings"])

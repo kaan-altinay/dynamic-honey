@@ -446,10 +446,15 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
         raise ValidationError("plan must remain static-only unless scripted flows are enabled")
 
     planned_output_count = _planned_output_count(plan)
-    if planned_output_count > runtime_config.max_bundle_artifacts:
+    # /_flow/ variants are synthesised by the flow_designer after the plan is committed;
+    # exclude them from the budget limit so the designer is not penalised for declaring them.
+    flow_artifact_count = sum(1 for a in plan.artifacts if a.path.startswith("/_flow/"))
+    non_flow_planned_count = planned_output_count - flow_artifact_count
+    if non_flow_planned_count > runtime_config.max_bundle_artifacts:
         raise ValidationError("plan exceeds max_bundle_artifacts")
 
-    if plan.bundle_budget_count > runtime_config.max_bundle_artifacts:
+    non_flow_budget_count = plan.bundle_budget_count - flow_artifact_count
+    if non_flow_budget_count > runtime_config.max_bundle_artifacts:
         raise ValidationError("plan bundle budget count exceeds runtime limit")
 
     if plan.bundle_budget_count != planned_output_count:
@@ -510,6 +515,7 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
                     unknown_dependencies,
                 )
             )
+        _validate_planned_flow_metadata(artifact, request, set(normalized_paths))
     for asset_fetch in plan.reference_asset_plan.asset_fetches:
         validate_planned_asset_fetch(asset_fetch, request)
         unknown_required = [
@@ -594,6 +600,81 @@ def validate_planned_artifact(
                 contract_content_type or expected_content_type,
             )
         )
+
+
+def _validate_flow_condition_fields(condition, context: str) -> None:
+    if condition is None:
+        return
+
+    for field_name in ("requires_cookie", "missing_cookie", "requires_prev_path", "method", "requires_header", "missing_header"):
+        value = getattr(condition, field_name, None)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValidationError("{} flow condition {} must be a non-empty string".format(context, field_name))
+
+    for field_name in ("query_has", "post_has"):
+        values = getattr(condition, field_name, [])
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValidationError("{} flow condition {} contains an empty name".format(context, field_name))
+
+    for field_name in ("header_equals", "header_contains", "query_equals", "query_contains", "post_equals", "post_contains"):
+        values = getattr(condition, field_name, {})
+        for key, value in values.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValidationError("{} flow condition {} contains an empty key".format(context, field_name))
+            if not isinstance(value, str):
+                raise ValidationError("{} flow condition {} value for {} must be a string".format(context, field_name, key))
+
+
+def _validate_flow_response_fields(response, context: str, known_paths: set[str] | None = None) -> None:
+    if response is None:
+        return
+    if response.artifact_path is None and response.redirect_to is None:
+        raise ValidationError("{} flow response must define artifact_path or redirect_to".format(context))
+    if response.artifact_path is not None:
+        if not isinstance(response.artifact_path, str) or not response.artifact_path.strip():
+            raise ValidationError("{} flow response artifact_path must be non-empty".format(context))
+        if known_paths is not None and response.artifact_path not in known_paths:
+            raise ValidationError("{} flow response references missing artifact {}".format(context, response.artifact_path))
+    if response.redirect_to is not None:
+        if not isinstance(response.redirect_to, str) or not response.redirect_to.strip():
+            raise ValidationError("{} flow response redirect_to must be non-empty".format(context))
+        normalize_path(response.redirect_to)
+    for name in response.set_cookie:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError("{} flow response set_cookie contains an empty cookie name".format(context))
+    for name in response.clear_cookie:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError("{} flow response clear_cookie contains an empty cookie name".format(context))
+    for header in response.headers:
+        if not isinstance(header, dict):
+            raise ValidationError("{} flow response headers must be objects".format(context))
+        for key, value in header.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValidationError("{} flow response header contains an empty name".format(context))
+            if not isinstance(value, str):
+                raise ValidationError("{} flow response header {} value must be a string".format(context, key))
+
+
+def _validate_planned_flow_metadata(artifact: PlannedArtifact, request: GenerationRequest, known_paths: set[str]) -> None:
+    has_flow_metadata = (
+        artifact.flow_match_path is not None
+        or artifact.flow_condition is not None
+        or artifact.flow_response is not None
+    )
+    if not has_flow_metadata:
+        return
+    if not artifact.path.startswith("/_flow/"):
+        raise ValidationError("artifact {} defines flow metadata but is not under /_flow/".format(artifact.path))
+    if not artifact.flow_match_path:
+        raise ValidationError("flow artifact {} requires flow_match_path".format(artifact.path))
+    normalized_match_path = normalize_path(artifact.flow_match_path, index_page=request.index_page)
+    if normalized_match_path != artifact.flow_match_path:
+        raise ValidationError("flow artifact {} flow_match_path is not normalized: {}".format(artifact.path, artifact.flow_match_path))
+    _validate_flow_condition_fields(artifact.flow_condition, "planned artifact {}".format(artifact.path))
+    if artifact.flow_response is None:
+        raise ValidationError("flow artifact {} requires flow_response".format(artifact.path))
+    _validate_flow_response_fields(artifact.flow_response, "planned artifact {}".format(artifact.path), known_paths)
 
 def validate_planned_asset_fetch(asset_fetch: PlannedAssetFetch, request: GenerationRequest) -> None:
     if normalize_path(asset_fetch.local_path, index_page=request.index_page) != asset_fetch.local_path:
@@ -890,35 +971,27 @@ def validate_flow_descriptor(descriptor, bundle_paths: set) -> None:
     - A cookie name is empty
     """
     for rule in descriptor.rules:
-        resp = rule.response
-        if resp.artifact_path is None and resp.redirect_to is None:
-            raise ValidationError(
-                "flow rule for {!r} has neither artifact_path nor redirect_to".format(rule.match_path)
-            )
-        if resp.artifact_path is not None and resp.artifact_path not in bundle_paths:
-            raise ValidationError(
-                "flow rule references artifact {!r} which is not in the bundle".format(resp.artifact_path)
-            )
-        if resp.redirect_to is not None:
-            try:
-                normalize_path(resp.redirect_to)
-            except Exception:
-                raise ValidationError(
-                    "flow rule redirect_to {!r} is not a valid path".format(resp.redirect_to)
-                )
-        for name in resp.set_cookie:
-            if not name:
-                raise ValidationError("flow rule set_cookie contains an empty cookie name")
-        for name in resp.clear_cookie:
-            if not name:
-                raise ValidationError("flow rule clear_cookie contains an empty cookie name")
+        if not isinstance(rule.match_path, str) or not rule.match_path.strip():
+            raise ValidationError("flow rule has empty match_path")
+        normalized_match_path = normalize_path(rule.match_path)
+        if normalized_match_path != rule.match_path:
+            raise ValidationError("flow rule match_path is not normalized: {}".format(rule.match_path))
+        _validate_flow_condition_fields(rule.condition, "flow rule for {!r}".format(rule.match_path))
+        _validate_flow_response_fields(
+            rule.response,
+            "flow rule for {!r}".format(rule.match_path),
+            bundle_paths,
+        )
 
 def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime_config: GeneratorRuntimeConfig) -> None:
     normalized_primary = normalize_path(bundle.primary_path, index_page=request.index_page)
     if normalized_primary != request.normalized_path:
         raise ValidationError("bundle primary path must match requested normalized path")
 
-    if len(bundle.artifacts) > runtime_config.max_bundle_artifacts:
+    non_flow_artifact_count = sum(
+        1 for a in bundle.artifacts if not a.path.startswith("/_flow/")
+    )
+    if non_flow_artifact_count > runtime_config.max_bundle_artifacts:
         raise ValidationError("bundle exceeds max_bundle_artifacts")
 
     _ensure_unique_paths(artifact.path for artifact in bundle.artifacts)

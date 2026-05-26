@@ -52,6 +52,9 @@ class TannerHandler:
             data["path"] = request.path_qs
             if "Cookie" in header:
                 data["cookies"] = {cookie.split("=")[0]: cookie.split("=")[1] for cookie in header["Cookie"].split(";")}
+        page_dir = getattr(self.run_args, "page_dir", None)
+        if isinstance(page_dir, str) and page_dir.strip():
+            data["page_dir"] = page_dir.strip()
         return data
 
     async def submit_data(self, data):
@@ -142,7 +145,7 @@ class TannerHandler:
         return parsed_endpoints
 
     async def _request_meta_generate_job(self, requested_path):
-        host = getattr(self.run_args, "host_ip", None)
+        host = getattr(self.run_args, "page_dir", None)  # page_dir is the configured domain (e.g. example.com)
         if not isinstance(host, str) or not host.strip():
             host = None
 
@@ -250,7 +253,40 @@ class TannerHandler:
             "hash": content_hash,
         }
 
-    async def _save_generated_artifacts(self, artifacts, requested_path):
+    def _load_flow_descriptors(self, flows_path):
+        if not os.path.exists(flows_path):
+            return {}
+        with open(flows_path) as flows_file:
+            flow_descriptors = json.load(flows_file)
+        if not isinstance(flow_descriptors, dict):
+            raise ValueError("flows.json must contain an object")
+        return flow_descriptors
+
+    def _prepare_flow_descriptor(self, requested_path, flow_descriptor):
+        if flow_descriptor is None:
+            return None
+        if not isinstance(flow_descriptor, dict):
+            raise ValueError("Flow descriptor payload must be an object")
+        if "rules" not in flow_descriptor or not isinstance(flow_descriptor.get("rules"), list):
+            raise ValueError("Flow descriptor payload must contain rules list")
+        return {
+            "path": self._normalize_meta_path(requested_path),
+            "descriptor": flow_descriptor,
+        }
+
+    def _write_prepared_flow_descriptor(self, prepared_flow_descriptor):
+        if prepared_flow_descriptor is None:
+            return
+        flows_path = os.path.join(self.dir, "flows.json")
+        updated_flows = self._load_flow_descriptors(flows_path)
+        updated_flows[prepared_flow_descriptor["path"]] = prepared_flow_descriptor["descriptor"]
+        temp_flows_path = "{}.tmp".format(flows_path)
+        with open(temp_flows_path, "w") as flows_file:
+            json.dump(updated_flows, flows_file, indent=2, sort_keys=True)
+        os.replace(temp_flows_path, flows_path)
+
+
+    async def _save_generated_artifacts(self, artifacts, requested_path, flow_descriptor=None):
         if not isinstance(artifacts, list) or not artifacts:
             raise ValueError("Meta job ready payload did not include artifacts")
 
@@ -262,6 +298,7 @@ class TannerHandler:
                 raise ValueError("Meta job bundle contains duplicate path {}".format(prepared_artifact["path"]))
             seen_paths.add(prepared_artifact["path"])
             prepared_artifacts.append(prepared_artifact)
+        prepared_flow_descriptor = self._prepare_flow_descriptor(requested_path, flow_descriptor)
 
         for prepared_artifact in prepared_artifacts:
             content_file = os.path.join(self.dir, prepared_artifact["hash"])
@@ -286,6 +323,7 @@ class TannerHandler:
             os.replace(temp_meta_path, meta_path)
             self.meta.clear()
             self.meta.update(updated_meta)
+            self._write_prepared_flow_descriptor(prepared_flow_descriptor)
 
     async def poll_meta_job(
         self,
@@ -326,6 +364,7 @@ class TannerHandler:
                         await self._save_generated_artifacts(
                             artifacts=artifacts,
                             requested_path=message.get("primary_path", requested_path),
+                            flow_descriptor=message.get("flow_descriptor"),
                         )
                     except ValueError as error:
                         self.logger.warning("Meta job %s returned invalid bundle: %s", meta_job_id, error)

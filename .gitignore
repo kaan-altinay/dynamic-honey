@@ -2,3 +2,4 @@ analysis/
 captures/
 captures_new/
 tanner/.venv/
+tanner/param_tuning/runs/

@@ -360,6 +360,24 @@ init_run_layout() {
   TANNER_PHPOX_CONTAINER="${PROJECT_NAME}-tanner-phpox"
 }
 
+select_capture_paths() {
+  PCAP_PATH="${RUN_DIR}/capture.pcap"
+  TCPDUMP_LOG_PATH="${RUN_DIR}/tcpdump.log"
+  if [[ ! -e "$RUN_DIR" || ! -e "$PCAP_PATH" ]]; then
+    return 0
+  fi
+  local idx=2
+  while :; do
+    local candidate_pcap="${RUN_DIR}/capture_${idx}.pcap"
+    if [[ ! -e "$candidate_pcap" ]]; then
+      PCAP_PATH="$candidate_pcap"
+      TCPDUMP_LOG_PATH="${RUN_DIR}/tcpdump_${idx}.log"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+}
+
 prepare_run_dirs() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
@@ -367,6 +385,35 @@ prepare_run_dirs() {
   mkdir -p "$RUN_DIR" "$RUNTIME_DIR" "$STATE_DIR"
 }
 
+
+ensure_page_dir_writable() {
+  local target_dir="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] ensure writable page dir ${target_dir}"
+    return 0
+  fi
+  if [[ ! -d "$target_dir" ]]; then
+    return 0
+  fi
+
+  if [[ -w "$target_dir" ]]; then
+    chmod u+rwx "$target_dir" || true
+  fi
+
+  local test_file="${target_dir}/.write-test.$$"
+  if touch "$test_file" >/dev/null 2>&1; then
+    rm -f "$test_file"
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo chmod -R a+rwX "$target_dir"
+    return 0
+  fi
+
+  echo "Page directory is not writable and sudo is unavailable: ${target_dir}" >&2
+  exit 1
+}
 seed_snare_state() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] prepare snare state in ${STATE_DIR}"
@@ -385,10 +432,9 @@ seed_snare_state() {
     fi
   fi
 
-  # Snare drops privileges to nobody; grant runtime write access for dynamic cache updates.
-  if [[ -d "$STATE_DIR/pages/${PAGE_URL}" ]]; then
-    run_cmd chmod -R a+rwX "$STATE_DIR/pages/${PAGE_URL}"
-  fi
+  # Snare drops privileges to nobody; ensure the page directory remains writable
+  # without failing on existing generated artifacts owned by another uid.
+  ensure_page_dir_writable "$STATE_DIR/pages/${PAGE_URL}"
 }
 
 write_tanner_config() {
@@ -467,6 +513,8 @@ services:
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     command: ["/opt/tanner/tanner-env/bin/tannerapi", "--config", "/opt/tanner/runtime-config/config.yaml"]
     volumes:
       - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
@@ -492,6 +540,8 @@ services:
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     ports:
       - '127.0.0.1:${WEB_PORT}:8091'
     command: ["/opt/tanner/tanner-env/bin/tannerweb", "--config", "/opt/tanner/runtime-config/config.yaml"]
@@ -521,12 +571,11 @@ services:
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      PYTHONPATH: "/opt/tanner-src"
-    working_dir: /opt/tanner-src
-    command: ["/opt/tanner/tanner-env/bin/python", "/opt/tanner-src/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    command: ["/opt/tanner/tanner-env/bin/tanner", "--config", "/opt/tanner/runtime-config/config.yaml"]
     volumes:
       - '${TANNER_CONFIG_PATH}:/opt/tanner/runtime-config/config.yaml:ro'
-      - '${ROOT_DIR}/tanner/tanner:/opt/tanner/tanner:ro'
       - '/var/run/docker.sock:/var/run/docker.sock'
     depends_on:
       - tanner_api
@@ -624,6 +673,87 @@ ensure_cliproxy_for_agentic() {
   echo "[ok] cli-proxy-api started (pid: ${cliproxy_pid})"
   echo "cliproxy_pid=${cliproxy_pid}" >> "$RUN_INFO_PATH"
   echo "cliproxy_started_by_run=1" >> "$RUN_INFO_PATH"
+}
+
+verify_llm_backend_from_tanner_container() {
+  if [[ "${MODE}" != "agentic" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] verify Tanner container can reach ${OPENAI_BASE_URL:-<unset>}"
+    return 0
+  fi
+
+  local backend_url="${OPENAI_BASE_URL:-}"
+  local backend_key="${OPENAI_API_KEY:-}"
+  if [[ -z "$backend_url" ]]; then
+    echo "OPENAI_BASE_URL is not set for agentic mode" >&2
+    exit 1
+  fi
+
+  echo "[info] Verifying Tanner container can reach LLM backend at ${backend_url}"
+  if ! docker exec -i "$TANNER_CONTAINER" python3 - "$backend_url" "$backend_key" <<'PY'
+import json
+import sys
+import urllib.request
+
+backend_url = sys.argv[1].rstrip("/")
+backend_key = sys.argv[2]
+request = urllib.request.Request(
+    backend_url + "/models",
+    headers={"Authorization": "Bearer " + backend_key} if backend_key else {},
+)
+with urllib.request.urlopen(request, timeout=10) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("unexpected non-object response from /models")
+    payload.get("data", [])
+PY
+  then
+    echo "Tanner container cannot reach the configured LLM backend (${backend_url}); refusing to keep the dynamic stack online." >&2
+    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans || true
+    run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" down --remove-orphans || true
+    exit 1
+  fi
+  echo "[ok] Tanner container can reach the configured LLM backend"
+}
+
+allow_cliproxy_from_tanner_network() {
+  if [[ "${MODE}" != "agentic" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] allow ${NETWORK_NAME} subnet(s) to reach cli-proxy-api on tcp/8317"
+    return 0
+  fi
+
+  require_cmd iptables
+  require_sudo_if_needed
+
+  local -a prefix=()
+  if [[ "$EUID" -ne 0 ]]; then
+    prefix=(sudo)
+  fi
+
+  local subnet
+  local inspected=0
+  while IFS= read -r subnet; do
+    [[ -z "$subnet" ]] && continue
+    inspected=1
+    if "${prefix[@]}" iptables -C INPUT -s "$subnet" -p tcp --dport 8317 -j ACCEPT >/dev/null 2>&1; then
+      echo "[info] cli-proxy-api firewall rule already allows ${subnet} -> tcp/8317"
+      continue
+    fi
+    "${prefix[@]}" iptables -I INPUT 1 -s "$subnet" -p tcp --dport 8317 -j ACCEPT
+    echo "[ok] Added cli-proxy-api firewall allow rule for ${subnet} -> tcp/8317"
+  done < <(docker network inspect "$NETWORK_NAME" --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}')
+
+  if [[ "$inspected" -eq 0 ]]; then
+    echo "Could not determine subnet(s) for Docker network ${NETWORK_NAME}" >&2
+    exit 1
+  fi
 }
 
 write_run_info() {
@@ -731,20 +861,20 @@ start_run() {
   build_forward_port_list
   build_tcpdump_filter
   init_run_layout
+  select_capture_paths
 
   if [[ -e "$RUN_DIR" ]]; then
-    echo "Run directory already exists: $RUN_DIR" >&2
-    echo "Use a new --run-name or stop/remove the existing run first." >&2
-    exit 1
+    echo "[info] Reusing existing run directory: $RUN_DIR"
+    echo "[info] New capture artifact will be: ${PCAP_PATH}"
   fi
 
   prepare_run_dirs
   seed_snare_state
 
   if [[ "${MODE}" == "agentic" ]]; then
-    export OPENAI_BASE_URL="http://172.25.0.1:8317/v1"
-    export OPENAI_API_BASE="http://172.25.0.1:8317/v1"
-    export OPENAI_API_KEY="sk-mor5R6MlcggVCit9qS3XzjqjW4Egc9PCOyZuWZYy1qUrf"
+    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://host.docker.internal:8317/v1}"
+    export OPENAI_API_BASE="${OPENAI_API_BASE:-http://host.docker.internal:8317/v1}"
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-mor5R6MlcggVCit9qS3XzjqjW4Egc9PCOyZuWZYy1qUrf}"
   fi
 
   write_tanner_config "$MODE"
@@ -767,9 +897,15 @@ start_run() {
 
   if [[ "$BUILD" -eq 1 ]]; then
     run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d --build
-    run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d --build
   else
     run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d
+  fi
+  allow_cliproxy_from_tanner_network
+  verify_llm_backend_from_tanner_container
+
+  if [[ "$BUILD" -eq 1 ]]; then
+    run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d --build
+  else
     run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d
   fi
 

@@ -77,7 +77,7 @@ async def main():
 
     generator = TracingGenerator(runtime_config=cfg)
 
-    path = "/hudson"
+    path = "/_profiler/phpinfo"
     bundle = await generator.generate_bundle(
         host="example.com",
         path=path,

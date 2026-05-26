@@ -16,7 +16,9 @@ SSH port forward (run on your local machine):
     ssh -L 8765:127.0.0.1:8765 proxmox-vm
 """
 
+import argparse
 import asyncio
+import hashlib
 import http.cookies
 import json
 import sys
@@ -24,7 +26,9 @@ import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
+from urllib.parse import unquote
 
 from tanner.flow.flow_evaluator import FlowEvaluator, FlowMatchResult
 from tanner.generator.agentic.models import (
@@ -48,6 +52,92 @@ def role(model: str, temperature: float, max_tokens: int) -> GeneratorRoleConfig
     )
 
 
+
+def _normalize_path(path: str) -> str:
+    normalized = (path or "").split("?", 1)[0]
+    normalized = unquote(normalized)
+    if not normalized:
+        normalized = "/"
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
+
+
+def build_smoketest_config(model_name: str = "gpt-5.4") -> GeneratorRuntimeConfig:
+    return GeneratorRuntimeConfig(
+        backend="agentic",
+        enable_scripted_flows=True,          # V2
+        max_review_loops=1,
+        max_bundle_artifacts=8,
+        max_bundle_bytes=2_000_000,
+        checkpoint_path="/tmp/tanner-agentic-v2-smoketest.sqlite",
+        graph_recursion_limit=200,
+        review_log_path="/tmp/tanner-agentic-v2-review-log.json",
+        enable_live_research=True,
+        max_tool_response_chars=4_000,
+        max_command_output_chars=2_000,
+        command_timeout=2,
+        max_concurrent_model_calls=1,
+        inter_call_delay_seconds=12.5,
+        max_rate_limit_retries=3,
+        default_rate_limit_backoff_seconds=12.0,
+        max_length_limit_retries=3,
+        length_retry_token_increase=800,
+        max_length_retry_tokens=6_000,
+        roles={
+            "expert": role(model_name, 0.0, 1800),
+            "design": role(model_name, 0.0, 2800),
+            "coder": role(model_name, 0.1, 1600),
+            "review": role(model_name, 0.0, 1600),
+        },
+    )
+
+
+def save_bundle_to_snare_root(
+    bundle,
+    snare_root: str | Path,
+    *,
+    page_url: str = "example.com",
+) -> Path:
+    snare_root = Path(snare_root).resolve()
+    page_dir = snare_root / "pages" / page_url
+    page_dir.mkdir(parents=True, exist_ok=True)
+
+    meta: dict[str, dict] = {}
+    for artifact in bundle.artifacts:
+        artifact_path = _normalize_path(artifact.path)
+        body = bytes(artifact.body_bytes)
+        digest = hashlib.md5(body).hexdigest()
+        (page_dir / digest).write_bytes(body)
+        meta[artifact_path] = {
+            "hash": digest,
+            "headers": artifact.headers if isinstance(artifact.headers, list) else [],
+        }
+
+    (page_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+
+    if bundle.flow_descriptor is not None:
+        flows = {bundle.primary_path: bundle.flow_descriptor.model_dump(mode="json")}
+        (page_dir / "flows.json").write_text(json.dumps(flows, indent=2, sort_keys=True) + "\n")
+
+    summary = {
+        "primary_path": bundle.primary_path,
+        "used_fallback": bundle.used_fallback,
+        "review_summary": bundle.review_summary,
+        "artifact_count": len(bundle.artifacts),
+        "artifacts": [
+            {
+                "path": artifact.path,
+                "kind": artifact.kind,
+                "bytes": len(bytes(artifact.body_bytes)),
+                "headers": artifact.headers,
+            }
+            for artifact in bundle.artifacts
+        ],
+        "flow_descriptor": bundle.flow_descriptor.model_dump(mode="json") if bundle.flow_descriptor is not None else None,
+    }
+    (snare_root / "bundle_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return snare_root
 def dump(value):
     if hasattr(value, "model_dump_json"):
         try:
@@ -298,47 +388,39 @@ def make_handler(bundle, evaluator: FlowEvaluator | None):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-async def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "/wp-login.php"
-
-    model_name = "gpt-5.4"
-
-    cfg = GeneratorRuntimeConfig(
-        backend="agentic",
-        enable_scripted_flows=True,          # V2
-        max_review_loops=1,
-        max_bundle_artifacts=8,
-        max_bundle_bytes=2_000_000,
-        checkpoint_path="/tmp/tanner-agentic-v2-smoketest.sqlite",
-        graph_recursion_limit=200,
-        review_log_path="/tmp/tanner-agentic-v2-review-log.json",
-        enable_live_research=True,
-        max_tool_response_chars=4_000,
-        max_command_output_chars=2_000,
-        command_timeout=2,
-        max_concurrent_model_calls=1,
-        inter_call_delay_seconds=12.5,
-        max_rate_limit_retries=3,
-        default_rate_limit_backoff_seconds=12.0,
-        max_length_limit_retries=3,
-        length_retry_token_increase=800,
-        max_length_retry_tokens=6_000,
-        roles={
-            "expert": role(model_name, 0.0, 1800),
-            "design": role(model_name, 0.0, 2800),
-            "coder": role(model_name, 0.1, 1600),
-            "review": role(model_name, 0.0, 1600),
-        },
-    )
-
-    generator = TracingGenerator(runtime_config=cfg)
-
-    print(f"\n=== GENERATING V2 BUNDLE: {path} ===")
-    bundle = await generator.generate_bundle(
+async def generate_bundle_for_path(
+    path: str,
+    cfg: GeneratorRuntimeConfig,
+    *,
+    verbose: bool = True,
+):
+    generator_cls = TracingGenerator if verbose else AgenticBundleGenerator
+    generator = generator_cls(runtime_config=cfg)
+    if verbose:
+        print(f"\n=== GENERATING V2 BUNDLE: {path} ===")
+    return await generator.generate_bundle(
         host="example.com",
         path=path,
         site_profile={"index_page": "/index.html"},
     )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate and preview or save a V2 smoketest bundle.")
+    parser.add_argument("endpoint", nargs="?", default="/wp-login.php")
+    parser.add_argument("--model-name", default="gpt-5.4")
+    parser.add_argument("--save-root", default=None, help="Save bundle as a preview.py-compatible snare root and exit.")
+    parser.add_argument("--page-url", default="example.com")
+    parser.add_argument("--preview-port", type=int, default=8765)
+    parser.add_argument("--quiet", action="store_true", help="Disable tracing output.")
+    return parser.parse_args()
+
+
+async def main():
+    args = parse_args()
+    path = args.endpoint
+    cfg = build_smoketest_config(args.model_name)
+    bundle = await generate_bundle_for_path(path, cfg, verbose=not args.quiet)
 
     print("\n=== FINAL BUNDLE ===")
     print("primary_path :", bundle.primary_path)
@@ -349,9 +431,7 @@ async def main():
         tag = "  [flow variant]" if a.path.startswith("/_flow/") else ""
         print(f"  {a.path:50s}  {a.kind:20s}  {len(a.body_bytes):>7,} bytes{tag}")
 
-    # ── flow descriptor ───────────────────────────────────────────────────────
     evaluator: FlowEvaluator | None = None
-
     if bundle.flow_descriptor is not None:
         print(f"\n=== FLOW DESCRIPTOR ===")
         print_flow_descriptor(bundle.flow_descriptor)
@@ -362,16 +442,22 @@ async def main():
         print("  (design node did not produce /_flow/ variants or dynamic_candidate paths)")
         print("  Try a login/admin path: smoketest_v2.py /wp-admin/login.php")
 
-    # ── preview server ────────────────────────────────────────────────────────
+    if args.save_root:
+        saved_root = save_bundle_to_snare_root(bundle, args.save_root, page_url=args.page_url)
+        print("\n=== BUNDLE SAVED ===")
+        print(f"snare_root: {saved_root}")
+        print(f"preview:    python preview.py --snare-root {saved_root} --endpoint {bundle.primary_path}")
+        return
+
     handler_class = make_handler(bundle, evaluator)
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), handler_class)
+    server = ThreadingHTTPServer(("127.0.0.1", args.preview_port), handler_class)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     print("\n=== PREVIEW SERVER ===")
     print("SSH port forward (run on your LOCAL machine):")
-    print("  ssh -L 8765:127.0.0.1:8765 proxmox-vm")
-    print(f"\nThen open:  http://127.0.0.1:8765{bundle.primary_path}")
+    print(f"  ssh -L {args.preview_port}:127.0.0.1:{args.preview_port} proxmox-vm")
+    print(f"\nThen open:  http://127.0.0.1:{args.preview_port}{bundle.primary_path}")
     print()
     if evaluator:
         print("Flow rules are live.  Cookies and request history persist across")
@@ -386,7 +472,8 @@ async def main():
         server.server_close()
 
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    print("\nPreview stopped.")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nPreview stopped.")

@@ -13,6 +13,66 @@ if "aioredis" not in sys.modules:
     fake_aioredis.exceptions = types.SimpleNamespace(ConnectionError=Exception)
     sys.modules["aioredis"] = fake_aioredis
 
+if "redis" not in sys.modules:
+    fake_redis = types.ModuleType("redis")
+    fake_redis.asyncio = types.SimpleNamespace()
+    sys.modules["redis"] = fake_redis
+
+if "aiodocker" not in sys.modules:
+    fake_aiodocker = types.ModuleType("aiodocker")
+    fake_aiodocker.Docker = lambda *args, **kwargs: mock.Mock()
+    fake_aiodocker.exceptions = types.SimpleNamespace(DockerError=Exception, DockerContainerError=Exception)
+    sys.modules["aiodocker"] = fake_aiodocker
+
+if "aiomysql" not in sys.modules:
+    fake_aiomysql = types.ModuleType("aiomysql")
+    async def _fake_connect(*args, **kwargs):
+        return mock.AsyncMock()
+    fake_aiomysql.connect = _fake_connect
+    sys.modules["aiomysql"] = fake_aiomysql
+
+if "mimesis" not in sys.modules:
+    fake_mimesis = types.ModuleType("mimesis")
+    class _FakePerson:
+        def __init__(self, *args, **kwargs):
+            pass
+        def username(self):
+            return "user"
+        def email(self):
+            return "user@example.com"
+        def password(self):
+            return "password"
+    class _FakeText:
+        def text(self, quantity=1):
+            return "text"
+    fake_mimesis.Person = _FakePerson
+    fake_mimesis.Text = _FakeText
+    sys.modules["mimesis"] = fake_mimesis
+
+if "geoip2" not in sys.modules:
+    fake_geoip2 = types.ModuleType("geoip2")
+    fake_geoip2_database = types.ModuleType("geoip2.database")
+    class _FakeReader:
+        def __init__(self, *args, **kwargs):
+            pass
+    fake_geoip2_database.Reader = _FakeReader
+    fake_geoip2.database = fake_geoip2_database
+    sys.modules["geoip2"] = fake_geoip2
+    sys.modules["geoip2.database"] = fake_geoip2_database
+
+if "bson" not in sys.modules:
+    fake_bson = types.ModuleType("bson")
+    fake_bson_objectid = types.ModuleType("bson.objectid")
+    fake_bson_objectid.ObjectId = lambda value=None: value or "object-id"
+    fake_bson.objectid = fake_bson_objectid
+    sys.modules["bson"] = fake_bson
+    sys.modules["bson.objectid"] = fake_bson_objectid
+
+if "gridfs" not in sys.modules:
+    fake_gridfs = types.ModuleType("gridfs")
+    fake_gridfs.GridFS = lambda *args, **kwargs: mock.Mock()
+    sys.modules["gridfs"] = fake_gridfs
+
 if "pylibinjection" not in sys.modules:
     fake_pylibinjection = types.ModuleType("pylibinjection")
     fake_pylibinjection.sqli = lambda value, flags=0: (False, "")
@@ -200,6 +260,19 @@ class TestServer(AioHTTPTestCase):
             ],
             "review_summary": "approved",
             "used_fallback": False,
+            "flow_descriptor": {
+                "rules": [
+                    {
+                        "match_path": "/seed/page",
+                        "condition": {"missing_header": "Authorization"},
+                        "response": {
+                            "artifact_path": "/_flow/seed-page/auth-required",
+                            "status_code": 401,
+                        },
+                        "priority": 10,
+                    }
+                ]
+            },
         }
         self.serv.generator.generate_bundle = AsyncMock(return_value=bundle)
         self.serv._save_meta_job = AsyncMock()
@@ -212,6 +285,8 @@ class TestServer(AioHTTPTestCase):
         self.assertEqual(saved_fields["primary_path"], "/seed/page")
         self.assertEqual(saved_fields["review_summary"], "approved")
         self.assertEqual(len(saved_fields["artifacts"]), 2)
+        self.assertIn("flow_descriptor", saved_fields)
+        self.assertEqual(saved_fields["flow_descriptor"]["rules"][0]["match_path"], "/seed/page")
         self.assertEqual(saved_fields["artifacts"][0]["path"], "/seed/page")
         self.assertEqual(
             base64.b64decode(saved_fields["artifacts"][0]["body_b64"]),
@@ -227,6 +302,7 @@ class TestServer(AioHTTPTestCase):
                 "artifacts": '[{"path": "/seed/page", "kind": "html_page", "headers": [{"Content-Type": "text/html; charset=utf-8"}], "body_b64": "c2VlZA==", "status_code": 200}]',
                 "review_summary": "approved",
                 "used_fallback": "False",
+                "flow_descriptor": '{"rules": [{"match_path": "/seed/page", "condition": {"missing_header": "Authorization"}, "response": {"artifact_path": "/_flow/seed-page/auth-required", "status_code": 401}, "priority": 10}]}',
             }
         )
 
@@ -241,6 +317,7 @@ class TestServer(AioHTTPTestCase):
         self.assertFalse(message["used_fallback"])
         self.assertEqual(len(message["artifacts"]), 1)
         self.assertEqual(message["artifacts"][0]["path"], "/seed/page")
+        self.assertEqual(message["flow_descriptor"]["rules"][0]["match_path"], "/seed/page")
 
 
     @unittest_run_loop

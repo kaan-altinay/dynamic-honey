@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 IntentFamily = Literal[
@@ -12,6 +12,14 @@ IntentFamily = Literal[
     "backup_probe",
     "cms_probe",
     "generic_recon",
+    "auth_portal",
+    "network_device",
+    "container_api",
+    "kubernetes_api",
+    "elastic_api",
+    "solr_api",
+    "config_secret",
+    "webshell_probe",
 ]
 
 ArtifactKind = Literal[
@@ -47,6 +55,15 @@ class GenerationRequest(ModelBase):
     site_profile: dict[str, Any] = Field(default_factory=dict)
     request_kind: Literal["seed", "runtime_miss"] = "runtime_miss"
     index_page: str = "/index.html"
+
+class EndpointSemanticHint(ModelBase):
+    """General V2 hint derived from path terms; advisory prompt context only."""
+    path_tokens: list[str] = Field(default_factory=list)
+    likely_resource_terms: list[str] = Field(default_factory=list)
+    likely_protocol_terms: list[str] = Field(default_factory=list)
+    likely_interaction_styles: list[str] = Field(default_factory=list)
+    suggested_response_shapes: list[str] = Field(default_factory=list)
+
 
 
 class ExpertSpec(ModelBase):
@@ -87,6 +104,10 @@ class PlannedArtifact(ModelBase):
     artifact_scope: ArtifactScope = "static_file"
     dynamic_candidate: bool = False
     service_candidate: bool = False
+    flow_match_path: str | None = None
+    flow_condition: FlowCondition | None = None
+    flow_response: FlowResponse | None = None
+    flow_priority: int = 0
 
 
 class ResourcePlan(ModelBase):
@@ -98,6 +119,7 @@ class ResourcePlan(ModelBase):
     bundle_budget_bytes: int = Field(ge=1)
     static_only: bool = True
     review_focus: list[str] = Field(default_factory=list)
+    coherence_facts: dict[str, Any] = Field(default_factory=dict)
 
 
 class HeaderHint(ModelBase):
@@ -349,6 +371,16 @@ class FlowCondition(ModelBase):
     min_prior_post_count_to_path: int | None = None  # prior POSTs before current request
     lockout_window_seconds: int | None = None     # cooldown duration after threshold
     lockout_active: bool | None = None            # require active/inactive cooldown state
+    requires_header: str | None = None            # header key must be present
+    missing_header: str | None = None             # header key must be absent
+    header_equals: dict[str, str] = Field(default_factory=dict)
+    header_contains: dict[str, str] = Field(default_factory=dict)
+    query_has: list[str] = Field(default_factory=list)
+    query_equals: dict[str, str] = Field(default_factory=dict)
+    query_contains: dict[str, str] = Field(default_factory=dict)
+    post_has: list[str] = Field(default_factory=list)
+    post_equals: dict[str, str] = Field(default_factory=dict)
+    post_contains: dict[str, str] = Field(default_factory=dict)
 
 
 class FlowResponse(ModelBase):
@@ -358,6 +390,8 @@ class FlowResponse(ModelBase):
     invalid credential submissions prefer an artifact_path that visibly contains
     failure feedback over a bare redirect back to the original form.  redirect_to
     is appropriate for protected-page guards, logout, and success transitions.
+    set_cookie maps cookie-name -> cookie-value only; attributes such as
+    HttpOnly/Path/SameSite/Secure are not separate keys here.
     """
     artifact_path: str | None = None              # rewrite: serve this meta key
     redirect_to: str | None = None                # synthetic 302 Location
@@ -365,6 +399,36 @@ class FlowResponse(ModelBase):
     set_cookie: dict[str, str] = Field(default_factory=dict)
     clear_cookie: list[str] = Field(default_factory=list)
     headers: list[dict[str, str]] = Field(default_factory=list)
+
+    @field_validator("set_cookie", mode="before")
+    @classmethod
+    def _normalize_set_cookie(cls, value):
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            return value
+        cookie_attribute_keys = {
+            "httponly",
+            "path",
+            "secure",
+            "samesite",
+            "domain",
+            "max-age",
+            "expires",
+        }
+        normalized = {}
+        for key, raw_value in value.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            if key.strip().lower() in cookie_attribute_keys:
+                continue
+            if isinstance(raw_value, str):
+                normalized[key] = raw_value
+            elif isinstance(raw_value, (int, float, bool)):
+                normalized[key] = str(raw_value)
+            elif raw_value is not None:
+                normalized[key] = str(raw_value)
+        return normalized
 
 
 class FlowRule(ModelBase):

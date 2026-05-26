@@ -26,6 +26,7 @@ from tanner.generator.agentic.models import (
     FlowRule,
     ArtifactDraft,
     ArtifactReferenceContext,
+    EndpointSemanticHint,
     ExpertSpec,
     FetchedAsset,
     GeneratedArtifact,
@@ -85,7 +86,8 @@ class GraphState(TypedDict, total=False):
     trace_notes: Annotated[list[str], operator.add]
     errors: Annotated[list[str], operator.add]
     plan_revision: int
-    flow_descriptor: dict  # serialized FlowDescriptor when V2 active
+    flow_descriptor: dict | None  # serialized FlowDescriptor when V2 active
+    coherence_bindings: dict[str, str] | None  # V2 only: flat str→str binding table from design
 
 
 class AgenticBundleGenerator(BaseGenerator):
@@ -135,17 +137,16 @@ class AgenticBundleGenerator(BaseGenerator):
         )
         builder.add_conditional_edges("prepare_reference_pack", self._fan_out_coders, ["coder_node"])
         builder.add_edge("coder_node", "assemble_bundle")
-        builder.add_edge("assemble_bundle", "review_node")
         if self.runtime_config.enable_scripted_flows:
             builder.add_node("flow_designer", self._flow_designer_node)
-            builder.add_edge("flow_designer", "finalize_bundle")
-            approve_target = "flow_designer"
+            builder.add_edge("assemble_bundle", "flow_designer")
+            builder.add_edge("flow_designer", "review_node")
         else:
-            approve_target = "finalize_bundle"
+            builder.add_edge("assemble_bundle", "review_node")
         builder.add_conditional_edges(
             "review_node",
             self._route_after_review,
-            {"approve": approve_target, "revise": "design_node", "fallback": "fallback_node"},
+            {"approve": "finalize_bundle", "revise": "design_node", "fallback": "fallback_node"},
         )
         builder.add_edge("finalize_bundle", END)
         builder.add_edge("fallback_node", END)
@@ -247,12 +248,20 @@ class AgenticBundleGenerator(BaseGenerator):
             )
             if model is None:
                 raise RuntimeError("{} model is unavailable".format(role_name))
-            # OpenAI strict response_format rejects free-form object schemas used by
-            # StructuredJsonDocumentDraft (content_model.document as arbitrary JSON).
-            # Use function-calling for this specific schema to preserve compatibility
-            # without changing stricter structured-output behavior for other schemas.
+            # OpenAI strict response_format rejects some schemas we intentionally
+            # use for V2 planning/generation:
+            # - StructuredJsonDocumentDraft allows arbitrary JSON content_model.document
+            # - ResourcePlan now carries first-class flow metadata and free-form
+            #   coherence_facts, which produce a schema OpenAI rejects under strict
+            #   response_format validation
+            # Use function-calling for those schemas to preserve structured parsing
+            # without weakening other roles unnecessarily.
             structured_output_method = None
-            if role_name == "coder" and getattr(schema, "__name__", "") == "StructuredJsonDocumentDraft":
+            schema_name = getattr(schema, "__name__", "")
+            if (
+                (role_name == "coder" and schema_name == "StructuredJsonDocumentDraft")
+                or (role_name == "design" and schema_name == "ResourcePlan")
+            ):
                 structured_output_method = "function_calling"
 
             if structured_output_method is None:
@@ -511,6 +520,74 @@ class AgenticBundleGenerator(BaseGenerator):
         return "\n\n---\n\n".join(evidence_sections)
 
     @staticmethod
+    def _build_flow_evidence(bundle: GeneratedBundle) -> str:
+        """Summarize flow rules so review evaluates scripted behavior too."""
+        descriptor = getattr(bundle, "flow_descriptor", None)
+        if descriptor is None:
+            return "none"
+
+        lines = []
+        for rule in sorted(descriptor.rules, key=lambda value: value.priority, reverse=True):
+            cond = rule.condition
+            cond_parts = []
+            if cond is not None:
+                if cond.method:
+                    cond_parts.append("method={}".format(cond.method))
+                if cond.requires_cookie:
+                    cond_parts.append("requires_cookie={}".format(cond.requires_cookie))
+                if cond.missing_cookie:
+                    cond_parts.append("missing_cookie={}".format(cond.missing_cookie))
+                if cond.requires_prev_path:
+                    cond_parts.append("requires_prev_path={}".format(cond.requires_prev_path))
+                if cond.min_post_count_to_path is not None:
+                    cond_parts.append("min_post_count={}".format(cond.min_post_count_to_path))
+                if cond.min_prior_post_count_to_path is not None:
+                    cond_parts.append("min_prior_post_count={}".format(cond.min_prior_post_count_to_path))
+                if cond.lockout_window_seconds is not None:
+                    cond_parts.append("lockout_window_seconds={}".format(cond.lockout_window_seconds))
+                if cond.lockout_active is not None:
+                    cond_parts.append("lockout_active={}".format(cond.lockout_active))
+                if cond.requires_header:
+                    cond_parts.append("requires_header={}".format(cond.requires_header))
+                if cond.missing_header:
+                    cond_parts.append("missing_header={}".format(cond.missing_header))
+                if cond.header_equals:
+                    cond_parts.append("header_equals={}".format(cond.header_equals))
+                if cond.header_contains:
+                    cond_parts.append("header_contains={}".format(cond.header_contains))
+                if cond.query_has:
+                    cond_parts.append("query_has={}".format(cond.query_has))
+                if cond.query_equals:
+                    cond_parts.append("query_equals={}".format(cond.query_equals))
+                if cond.query_contains:
+                    cond_parts.append("query_contains={}".format(cond.query_contains))
+                if cond.post_has:
+                    cond_parts.append("post_has={}".format(cond.post_has))
+                if cond.post_equals:
+                    cond_parts.append("post_equals={}".format(cond.post_equals))
+                if cond.post_contains:
+                    cond_parts.append("post_contains={}".format(cond.post_contains))
+            response = rule.response
+            action_parts = []
+            if response.artifact_path:
+                action_parts.append("serve {}".format(response.artifact_path))
+            if response.redirect_to:
+                action_parts.append("redirect {}".format(response.redirect_to))
+            if response.set_cookie:
+                action_parts.append("set_cookie={}".format(sorted(response.set_cookie)))
+            if response.clear_cookie:
+                action_parts.append("clear_cookie={}".format(response.clear_cookie))
+            lines.append(
+                "priority={priority} match={match} when={condition} action={action}".format(
+                    priority=rule.priority,
+                    match=rule.match_path,
+                    condition=", ".join(cond_parts) if cond_parts else "always",
+                    action=", ".join(action_parts) if action_parts else "none",
+                )
+            )
+        return "\n".join(lines) if lines else "none"
+
+    @staticmethod
     def _normalize_review_decision(structured_decision: StructuredReviewDecision) -> ReviewDecision:
         return ReviewDecision(
             decision=structured_decision.decision,
@@ -704,6 +781,19 @@ class AgenticBundleGenerator(BaseGenerator):
             )
             research_snippets = " | ".join(research.snippets) if research.snippets else "none"
             research_links = ", ".join(research.references) if research.references else "none"
+        v2_intent_prompt = ""
+        if self.runtime_config.enable_scripted_flows:
+            v2_intent_prompt = (
+                "\nV2-only endpoint families are also available when they fit better than the baseline families:\n"
+                "- auth_portal: Authentication, authorization, VPN, SSO, manager, or login surfaces\n"
+                "- network_device: Router, appliance, CGI, SOAP/XML, HNAP/TR-064/IGD/WS-Man style management surfaces\n"
+                "- container_api: Container runtime or registry discovery APIs\n"
+                "- kubernetes_api: Cluster API resources such as pods, services, nodes, namespaces, and targets\n"
+                "- elastic_api: Search-cluster endpoints such as indices, nodes, stats, health, and cat APIs\n"
+                "- solr_api: Search administration endpoints such as cores and system info\n"
+                "- config_secret: Environment/configuration/SCM secret disclosures\n"
+                "- webshell_probe: Command, upload, shell, PHP CGI, or powershell probing surfaces"
+            )
         messages = [
             {
                 "role": "system",
@@ -717,7 +807,8 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- framework_probe: Attacker enumerates framework-specific resources (Laravel, Django, etc.)\n"
                     "- backup_probe: Attacker searches for backup archives, manifests, or export listings\n"
                     "- generic_recon: General reconnaissance of service structure and nearby resources"
-                ),
+                    "{v2_intent_prompt}"
+                ).format(v2_intent_prompt=v2_intent_prompt),
             },
             {
                 "role": "user",
@@ -740,6 +831,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     intent=heuristic_spec.intent_family,
                     snippets=research_snippets,
                     links=research_links,
+                    v2_intent_prompt=v2_intent_prompt,
                 ),
             },
         ]
@@ -766,6 +858,115 @@ class AgenticBundleGenerator(BaseGenerator):
             "HTML/JSON/text artifacts instead of stateful flow artifacts."
         )
 
+    @staticmethod
+    def _endpoint_semantic_hint(path: str) -> EndpointSemanticHint:
+        """Infer generic path semantics for V2 prompts without binding behavior to endpoints."""
+        lowered = path.lower()
+        raw_tokens = re.split(r"[^a-z0-9]+", lowered)
+        tokens = [token for token in raw_tokens if token]
+        token_set = set(tokens)
+        resource_terms = [
+            token
+            for token in tokens
+            if token in {
+                "api", "v1", "v2", "json", "catalog", "container", "containers",
+                "pod", "pods", "service", "services", "node", "nodes", "target", "targets",
+                "db", "dbs", "index", "indices", "stats", "status", "config", "env",
+                "debug", "backup", "version", "manager", "admin", "login", "auth",
+                "session", "shell", "cmd", "exec", "upload", "download",
+            }
+        ]
+        protocol_terms = [
+            token
+            for token in tokens
+            if token in {"xml", "soap", "ws", "wsman", "cgi", "php", "json", "rest", "rpc"}
+        ]
+
+        interaction_styles = []
+        response_shapes = []
+        if token_set.intersection({"login", "auth", "signin", "password", "session", "manager", "admin"}):
+            interaction_styles.append("credential form or authorization challenge")
+            response_shapes.extend(["html", "redirect", "401"])
+        if token_set.intersection({"api", "v1", "v2", "json", "catalog", "containers", "pods", "services", "nodes", "targets", "version"}):
+            interaction_styles.append("API/resource discovery with coherent follow-up resources")
+            response_shapes.append("json")
+        if token_set.intersection({"config", "env", "settings", "server", "debug", "status"}):
+            interaction_styles.append("configuration/status disclosure with reinforcing support paths")
+            response_shapes.extend(["plain_text", "json"])
+        if token_set.intersection({"xml", "soap", "wsman", "ws", "rpc"}):
+            interaction_styles.append("XML or SOAP-like service description/action response")
+            response_shapes.append("xml")
+        if token_set.intersection({"shell", "cmd", "exec", "upload", "download", "cgi", "php"}):
+            interaction_styles.append("command/upload probe with fixed safe response artifacts")
+            response_shapes.extend(["plain_text", "html"])
+
+        return EndpointSemanticHint(
+            path_tokens=tokens,
+            likely_resource_terms=resource_terms,
+            likely_protocol_terms=protocol_terms,
+            likely_interaction_styles=interaction_styles,
+            suggested_response_shapes=sorted(set(response_shapes)),
+        )
+
+    @staticmethod
+    def _format_semantic_hint(hint: EndpointSemanticHint) -> str:
+        return (
+            "path_tokens={tokens}; resource_terms={resources}; protocol_terms={protocols}; "
+            "interaction_styles={styles}; suggested_response_shapes={shapes}"
+        ).format(
+            tokens=", ".join(hint.path_tokens) if hint.path_tokens else "none",
+            resources=", ".join(hint.likely_resource_terms) if hint.likely_resource_terms else "none",
+            protocols=", ".join(hint.likely_protocol_terms) if hint.likely_protocol_terms else "none",
+            styles=", ".join(hint.likely_interaction_styles) if hint.likely_interaction_styles else "none",
+            shapes=", ".join(hint.suggested_response_shapes) if hint.suggested_response_shapes else "none",
+        )
+
+    @staticmethod
+    def _v2_intent_family(normalized_path: str) -> str:
+        """Route V2-only endpoint families using broad path semantics."""
+        lowered = normalized_path.lower()
+        tokens = set(re.split(r"[^a-z0-9]+", lowered))
+        tokens.discard("")
+
+        if lowered.endswith(".env") or lowered in {"/.env", "/api/.env", "/env/.env", "/.git/config"}:
+            return "config_secret"
+        if lowered.startswith("/solr/") or "solr" in tokens:
+            return "solr_api"
+        if lowered.startswith("/api/v1/") or tokens.intersection({"pods", "services", "namespaces"}):
+            return "kubernetes_api"
+        if lowered.startswith("/_cat/") or lowered in {"/_nodes", "/_nodes/_local", "/_stats"} or tokens.intersection({"indices", "stats"}):
+            return "elastic_api"
+        if lowered in {"/containers/json", "/json/version", "/v2/_catalog"} or tokens.intersection({"containers", "catalog"}):
+            return "container_api"
+        if lowered in {"/hnap1", "/tr064dev.xml", "/igd.xml", "/wsman"} or tokens.intersection({"hnap1", "tr064dev", "igd", "wsman", "boaform", "setup"}):
+            return "network_device"
+        if tokens.intersection({"shell", "upload", "download", "powershell"}) or re.search(r"/(?:upl|get|1)\.php$", lowered):
+            return "webshell_probe"
+        if tokens.intersection({"login", "logon", "auth", "signin", "password", "sslvpn", "remote", "manager"}):
+            return "auth_portal"
+        return infer_intent_family(normalized_path)
+
+
+    @staticmethod
+    def _normalize_coherence_bindings(coherence_facts: dict) -> dict[str, str]:
+        """
+        Flatten coherence_facts into a str→str binding table for V2 coder enforcement.
+
+        Nested dicts/lists are serialized to compact JSON so every binding value is a
+        plain string the coder can echo verbatim.  Only called when enable_scripted_flows
+        is True so V1 code paths are not affected.
+        """
+        bindings: dict[str, str] = {}
+        for key, value in coherence_facts.items():
+            if isinstance(value, str):
+                bindings[key] = value
+            elif isinstance(value, (int, float, bool)):
+                bindings[key] = str(value)
+            elif isinstance(value, (dict, list)):
+                bindings[key] = json.dumps(value, separators=(",", ":"))
+            elif value is not None:
+                bindings[key] = str(value)
+        return bindings
     async def _design_node(self, state: GraphState):
         request = state["request"]
         expert_spec = state["expert_spec"]
@@ -785,10 +986,13 @@ class AgenticBundleGenerator(BaseGenerator):
                 "review_feedback": [],
                 "plan_revision": plan_revision,
                 "trace_notes": ["design:heuristic:low_confidence:{}:{}".format(heuristic_plan.primary_path, len(heuristic_plan.artifacts))],
+                "coherence_bindings": None,
             }
         reference_pages = await self._design_reference_candidates(request, expert_spec)
         reference_summary = self._summarize_reference_pages(reference_pages)
         compact_reference_summary = self._summarize_reference_pages_compact(reference_pages)
+        semantic_hint = self._endpoint_semantic_hint(request.normalized_path) if self.runtime_config.enable_scripted_flows else EndpointSemanticHint()
+        semantic_hint_text = self._format_semantic_hint(semantic_hint) if self.runtime_config.enable_scripted_flows else "none (V1 static mode)"
 
         def _build_design_messages(reference_candidates: str):
             return [
@@ -809,14 +1013,17 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- artifact.links_to: List every artifact/asset path this artifact should reference in its rendered output (e.g., a page should list its stylesheet, script, and nav link targets)\n"
                     "- artifact.response_contract: Define per-artifact HTTP contract with status_code, content_type, and optional headers_hint (name/value pairs)\n"
                     "- reference_asset_plan.asset_fetches: Remote assets you want copied locally for realism. Use this when you need a file derived from a real external source URL\n"
-                    "- reference_asset_plan.reference_urls: List the selected reference pages used to justify the design\n\n"
+                    "- reference_asset_plan.reference_urls: List the selected reference pages used to justify the design\n"
+                    "- coherence_facts: For V2 interactive bundles, define reusable names/IDs/versions/timestamps/hostnames/resource names that all artifacts should share. Leave empty only when there is no cross-artifact state to preserve.\n\n"
                     "Default values: render_strategy='deterministic', artifact_scope='static_file', must_exist=true, service_candidate=false. "
-                    "For scripted-flow mode, any generated HTML page with a POST form must define executable POST behavior on the form action path. "
-                    "The first three invalid submissions must each serve a visible invalid-credentials response artifact. "
-                    "Subsequent POSTs during the next 60 seconds must serve a visible too-many-attempts/lockout artifact. "
-                    "After that cooldown elapses, the same three-attempt cycle restarts for that client. Do not rely only on "
-                    "a missing-cookie redirect back to the login page.\n"
-                    "Set dynamic_candidate=true for endpoints that should participate in a stateful login/auth flow.\\n"
+                    "For scripted-flow mode, keep static_only=false when you intentionally plan stateful behavior. "
+                    "Use endpoint semantic hints as advisory context, not as mandatory labels. For discovery/config/status/protocol endpoints, prefer coherent supporting artifacts and shared coherence_facts over isolated one-off pages. "
+                    "If the same public path should react differently by method, headers, query parameters, POST fields, cookies, history, or content negotiation, make the response variants first-class ResourcePlan artifacts under /_flow/<slug>/<variant>. "
+                    "For first-class flow artifacts, set flow_match_path, flow_condition, flow_response, and flow_priority on that artifact; set flow_response.artifact_path to the flow artifact path when the variant should be served. Choose variant names that describe the behavior; do not include every possible variant by default. "
+                    "flow_response.set_cookie maps cookie-name -> cookie-value strings only. Do not put HttpOnly, Path, SameSite, Secure, Max-Age, or Expires inside set_cookie; those are cookie attributes, not cookie names. "
+                    "Any generated HTML page with a POST credential form must still define executable POST behavior on the form action path: the first three invalid submissions serve visible invalid-credentials feedback, and subsequent POSTs during the next 60 seconds serve visible too-many-attempts/lockout feedback. "
+                    "For non-auth API/config/static endpoints, do not invent flow variants unless a conditional response is genuinely plausible. "
+                    "Set dynamic_candidate=true for public paths that should participate in a stateful login/auth flow.\\n"
                     "{static_mode_rule}"
                 ).format(
                     max_artifacts=self.runtime_config.max_bundle_artifacts,
@@ -831,13 +1038,15 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Attacker goal: {goal}\n"
                     "Review feedback: {feedback}\n"
                     "Bundle budget: up to {count} total outputs, {bytes} bytes\n\n"
-                    "Contract rules (must satisfy all five):\n"
+                    "Contract rules (must satisfy all six):\n"
                     "1. No duplicate local paths across artifacts and asset_fetches\n"
                     "2. Every depends_on and required_for_artifact_ids value must reference a valid artifact_id in this plan\n"
                     "3. bundle_budget_count must exactly equal (number of artifacts + number of asset_fetches)\n"
                     "4. artifact.kind='asset_file' is forbidden in artifacts; use artifact.kind='binary_asset' for generated bytes or reference_asset_plan.asset_fetches for copied remote assets\n"
                     "5. Extension-kind contract for primary_path: .xml->xml_document (except /sitemap.xml->sitemap_xml), .json->json_document, .txt->plain_text (except /robots.txt->robots_txt), binary extensions (.ico/.jpg/.jpeg/.png/.gif/.webp/.bmp/.svg/.woff/.woff2/.ttf/.otf)->binary_asset\n\n"
+                    "6. V2 first-class flow artifacts under /_flow/ must include flow_match_path and flow_response; use flow_condition only when the rule depends on request shape or session state\n\n"
                     "Additional planning rule: {rule}\n\n"
+                    "Endpoint semantic hints (advisory, V2-only): {semantic_hint}\n\n"
                     "Example ResourcePlan for cms_probe intent (for reference only):\n"
                     "{{\n"
                     "  \"primary_path\": \"/wp-admin/login.php\",\n"
@@ -875,6 +1084,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     "  \"static_only\": true\n"
                     "}}\n\n"
                     "Reference page candidates:\n{reference_summary}\n\n"
+                    "ResourcePlan.coherence_facts should capture shared facts reused across artifacts when the bundle has related JSON/XML/text/pages.\n"
                     "Return a ResourcePlan with at least 2 generated artifacts that satisfies all contract rules."
                     ).format(
                         path=request.normalized_path,
@@ -885,6 +1095,7 @@ class AgenticBundleGenerator(BaseGenerator):
                         bytes=self.runtime_config.max_bundle_bytes,
                         rule=self._design_guardrails_for_intent(expert_spec.intent_family),
                         reference_summary=reference_candidates,
+                        semantic_hint=semantic_hint_text,
                     ),
                 },
             ]
@@ -927,10 +1138,16 @@ class AgenticBundleGenerator(BaseGenerator):
             )
             resource_plan = heuristic_plan
 
+        coherence_bindings = (
+            self._normalize_coherence_bindings(resource_plan.coherence_facts)
+            if self.runtime_config.enable_scripted_flows and resource_plan.coherence_facts
+            else None
+        )
         return {
             "resource_plan": resource_plan,
             "review_feedback": [],
             "plan_revision": plan_revision,
+            "coherence_bindings": coherence_bindings,
             "trace_notes": ["design:{}:{}".format(resource_plan.primary_path, len(resource_plan.artifacts))],
         }
 
@@ -983,11 +1200,22 @@ class AgenticBundleGenerator(BaseGenerator):
                 for link in artifact.links_to
                 if isinstance(link, str) and link.strip()
             ]
+            flow_response = artifact.flow_response
+            if flow_response is not None:
+                response_updates = {}
+                if flow_response.artifact_path:
+                    response_updates["artifact_path"] = normalize_path(flow_response.artifact_path, index_page=request.index_page)
+                if flow_response.redirect_to:
+                    response_updates["redirect_to"] = normalize_path(flow_response.redirect_to, index_page=request.index_page)
+                if response_updates:
+                    flow_response = flow_response.model_copy(update=response_updates)
             normalized_artifacts.append(
                 artifact.model_copy(
                     update={
                         "path": normalize_path(artifact.path, index_page=request.index_page),
                         "links_to": normalized_links,
+                        "flow_match_path": normalize_path(artifact.flow_match_path, index_page=request.index_page) if artifact.flow_match_path else None,
+                        "flow_response": flow_response,
                     }
                 )
             )
@@ -1104,6 +1332,7 @@ class AgenticBundleGenerator(BaseGenerator):
         resource_plan = state["resource_plan"]
         reference_pack = state.get("reference_pack")
         plan_revision = state.get("plan_revision", 0)
+        coherence_bindings = state.get("coherence_bindings")
         sends = []
         for artifact in resource_plan.artifacts:
             sends.append(
@@ -1116,6 +1345,7 @@ class AgenticBundleGenerator(BaseGenerator):
                         "reference_pack": reference_pack,
                         "pending_artifact": artifact,
                         "plan_revision": plan_revision,
+                        "coherence_bindings": coherence_bindings,
                     },
                 )
             )
@@ -1383,6 +1613,37 @@ class AgenticBundleGenerator(BaseGenerator):
         reference_urls = artifact_reference_context.reference_urls if artifact_reference_context is not None else []
         reference_notes = artifact_reference_context.notes if artifact_reference_context is not None else []
         allowed_paths = sorted(set(allowed_local_asset_paths + allowed_internal_paths))
+        if self.runtime_config.enable_scripted_flows:
+            _v2_bindings = state.get("coherence_bindings")
+            if _v2_bindings:
+                _binding_lines = "\n".join(
+                    "  {}: {}".format(k, v) for k, v in sorted(_v2_bindings.items())
+                )
+                coherence_section = (
+                    "BINDING TABLE — V2 hard constraints. You MUST reproduce these exact values "
+                    "wherever the corresponding entity appears in this artifact. Do not invent "
+                    "alternative spellings, IDs, versions, hostnames, or names for any key "
+                    "listed here:\n" + _binding_lines
+                )
+            else:
+                coherence_section = "none"
+        else:
+            coherence_section = (
+                json.dumps(resource_plan.coherence_facts, sort_keys=True)
+                if resource_plan.coherence_facts
+                else "none"
+            )
+        flow_metadata = "none"
+        if artifact.flow_match_path or artifact.flow_condition is not None or artifact.flow_response is not None:
+            flow_metadata = json.dumps(
+                {
+                    "flow_match_path": artifact.flow_match_path,
+                    "flow_condition": artifact.flow_condition.model_dump(mode="json") if artifact.flow_condition is not None else None,
+                    "flow_response": artifact.flow_response.model_dump(mode="json") if artifact.flow_response is not None else None,
+                    "flow_priority": artifact.flow_priority,
+                },
+                sort_keys=True,
+            )
         messages = [
             {
                 "role": "system",
@@ -1395,7 +1656,8 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- Return only the typed structured draft for the requested artifact kind\n"
                     "- artifact_id and path: echo the exact values from the user message\n"
                     "- headers_hint: must be a list of {{name, value}} objects\n"
-                    "- Do not invent file paths not provided in the allowed lists"
+                    "- Do not invent file paths not provided in the allowed lists\n"
+                    "- If this artifact path starts with /_flow/, make the visible content match the flow behavior described in purpose and flow metadata; do not make a generic page that hides the conditional response."
                 ),
             },
             {
@@ -1408,8 +1670,10 @@ class AgenticBundleGenerator(BaseGenerator):
                     "response_status_code: {response_status_code} (must match exactly)\n"
                     "response_content_type: {response_content_type} (must match exactly unless omitted)\n"
                     "response_headers_hint: {response_headers_hint}\n\n"
+                    "Flow metadata for this artifact: {flow_metadata}\n\n"
                     "Environment theme: {theme}\n"
                     "Reference pages: {reference_urls}\n"
+                    "{coherence_section}\n"
                     "Reference notes: {reference_notes}\n\n"
                     "Paths you MUST reference (from artifact.links_to): {must_reference}\n"
                     "Additional paths you MAY reference (other bundle artifacts/assets): {may_reference}\n"
@@ -1460,6 +1724,8 @@ class AgenticBundleGenerator(BaseGenerator):
                     if artifact.response_contract.headers_hint
                     else "none",
                     theme=expert_spec.environment_theme,
+                    coherence_section=coherence_section,
+                    flow_metadata=flow_metadata,
                     reference_urls=", ".join(reference_urls) if reference_urls else "none",
                     reference_notes=" | ".join(reference_notes) if reference_notes else "none",
                     must_reference=", ".join(artifact.links_to) if artifact.links_to else "none",
@@ -1567,8 +1833,14 @@ class AgenticBundleGenerator(BaseGenerator):
         request = state["request"]
         expert_spec = state["expert_spec"]
         resource_plan = state["resource_plan"]
-        bundle = state["generated_bundle"]
+        bundle = GeneratedBundle.model_validate(state["generated_bundle"])
         issues = list(state.get("errors", []))
+        flow_dict = state.get("flow_descriptor")
+        if flow_dict is not None and bundle.flow_descriptor is None:
+            try:
+                bundle = bundle.model_copy(update={"flow_descriptor": FlowDescriptor.model_validate(flow_dict)})
+            except Exception as error:
+                issues.append("invalid flow descriptor: {}".format(error))
 
         try:
             validate_plan(resource_plan, request, self.runtime_config)
@@ -1580,6 +1852,8 @@ class AgenticBundleGenerator(BaseGenerator):
             return self._review_revise_or_fallback(state, issues)
 
         review_evidence = self._build_review_evidence(bundle)
+        flow_evidence = self._build_flow_evidence(bundle)
+        coherence_facts = json.dumps(resource_plan.coherence_facts, sort_keys=True) if resource_plan.coherence_facts else "none"
         reference_pack = state.get("reference_pack") or ReferencePack()
         reference_evidence = self._summarize_reference_pages(reference_pack.reference_pages)
         fetched_asset_summary = ", ".join(
@@ -1600,7 +1874,9 @@ class AgenticBundleGenerator(BaseGenerator):
                     "2. UNREALISTIC_FIELDS: Form field names are generic (field1, field2, input1) instead of realistic (username, password, email)\n"
                     "3. MINIMAL_CONFIG: Config files have fewer than 3 entries or use obviously fake values ('changeme', 'password123')\n"
                     "4. BROKEN_THEME: Content contradicts the environment_theme (e.g., 'WordPress' theme but page says 'Drupal Admin')\n"
-                    "5. INTERNAL_LANGUAGE_LEAK: Text contains honeypot/lure/attacker/decoy/trap or synonyms despite the safety rule\n\n"
+                    "5. INTERNAL_LANGUAGE_LEAK: Text contains honeypot/lure/attacker/decoy/trap or synonyms despite the safety rule\n"
+                    "6. FLOW_ARTIFACT_MISMATCH: Scripted-flow variants are generic, invisible to the client, or contradict their trigger (for example lockout without lockout text, invalid-login flow without failure text, or no-auth/session-expired content that looks authenticated)\n"
+                    "7. COHERENCE_MISMATCH: Related JSON/XML/text/page artifacts contradict the supplied coherence_facts or use unrelated names, IDs, versions, timestamps, hosts, or resource labels\n\n"
                     "Return 'revise' if you find ANY of these blocking defects. Specify the defect category and affected artifact in required_fixes.\n"
                     "Return 'approve' for minor style issues, missing CSS polish, or other non-blocking gaps.\n"
                     "Return 'fallback' only if multiple severe defects make the bundle unusable."
@@ -1614,9 +1890,11 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Primary path: {primary}\n"
                     "Bundle paths: {paths}\n\n"
                     "Bundle evidence (structured features + content preview):\n{evidence}\n\n"
+                    "Flow rules:\n{flow_evidence}\n\n"
+                    "Coherence facts:\n{coherence_facts}\n\n"
                     "Reference pages consulted: {reference_evidence}\n"
                     "Fetched assets: {fetched_assets}\n\n"
-                    "Evaluate the bundle for the 5 quality defect categories listed in the system prompt.\n"
+                    "Evaluate the bundle for the 7 quality defect categories listed in the system prompt.\n"
                     "A link to {index_page} is permitted even if that page is not in this bundle."
                 ).format(
                     intent=expert_spec.intent_family,
@@ -1626,6 +1904,8 @@ class AgenticBundleGenerator(BaseGenerator):
                     evidence=review_evidence,
                     reference_evidence=reference_evidence,
                     fetched_assets=fetched_asset_summary,
+                    flow_evidence=flow_evidence,
+                    coherence_facts=coherence_facts,
                     index_page=request.index_page,
                 )
             },
@@ -1705,14 +1985,14 @@ class AgenticBundleGenerator(BaseGenerator):
             bundle.artifacts,
             key=lambda artifact: (artifact.path != bundle.primary_path, artifact.path),
         )
-        # Carry V2 flow descriptor from state if the flow_designer node produced one
-        flow_descriptor = None
+        # Carry V2 flow descriptor from flow_designer, preserving the bundle copy reviewed above.
+        flow_descriptor = bundle.flow_descriptor
         flow_dict = state.get("flow_descriptor")
         if flow_dict is not None:
             try:
                 flow_descriptor = FlowDescriptor.model_validate(flow_dict)
             except Exception:
-                self.logger.warning("_finalize_bundle: invalid flow_descriptor in state; discarding")
+                self.logger.warning("_finalize_bundle: invalid flow_descriptor in state; preserving reviewed bundle descriptor")
         finalized = bundle.model_copy(
             update={
                 "artifacts": artifacts,
@@ -1817,7 +2097,7 @@ class AgenticBundleGenerator(BaseGenerator):
         return base64.b64encode(b"binary-asset").decode("ascii")
 
     async def _heuristic_expert_spec(self, request: GenerationRequest) -> ExpertSpec:
-        intent_family = infer_intent_family(request.normalized_path)
+        intent_family = self._v2_intent_family(request.normalized_path) if self.runtime_config.enable_scripted_flows else infer_intent_family(request.normalized_path)
         research = None
         if self.runtime_config.enable_live_research:
             research_query = self._research_query_for_intent(intent_family, request.normalized_path)
@@ -1830,6 +2110,14 @@ class AgenticBundleGenerator(BaseGenerator):
             "admin_portal": "Internal administrative dashboard",
             "framework_probe": "Application framework reconnaissance",
             "generic_recon": "Generic service portal",
+            "auth_portal": "Administrative authentication portal",
+            "network_device": "Network device management interface",
+            "container_api": "Container service API",
+            "kubernetes_api": "Cluster orchestration API",
+            "elastic_api": "Search cluster API",
+            "solr_api": "Search administration API",
+            "config_secret": "Production application secrets",
+            "webshell_probe": "Web command or upload endpoint",
         }
         goal_by_intent = {
             "config_theft": "Obtain credentials, hostnames, and secret material from leaked configuration files.",
@@ -1838,6 +2126,14 @@ class AgenticBundleGenerator(BaseGenerator):
             "admin_portal": "Reach an administrative login or dashboard surface with nearby supporting assets.",
             "framework_probe": "Verify the underlying stack and enumerate framework-specific resources.",
             "generic_recon": "Map the service and test whether nearby resources disclose useful context.",
+            "auth_portal": "Reach an authentication or authorization surface and probe stateful access behavior.",
+            "network_device": "Identify network device management functions, XML services, and nearby control paths.",
+            "container_api": "Enumerate container/runtime API resources and related image or service metadata.",
+            "kubernetes_api": "Enumerate cluster API resources with coherent namespaces, nodes, pods, and services.",
+            "elastic_api": "Enumerate search cluster indices, nodes, health, and statistics.",
+            "solr_api": "Enumerate search cores and administration metadata.",
+            "config_secret": "Obtain credentials, hostnames, and secret material from leaked configuration files.",
+            "webshell_probe": "Probe command/upload surfaces while receiving fixed safe response artifacts.",
         }
         kind_by_intent = {
             "config_theft": "config_text",
@@ -1846,6 +2142,14 @@ class AgenticBundleGenerator(BaseGenerator):
             "admin_portal": "html_page",
             "framework_probe": "html_page",
             "generic_recon": "html_page",
+            "auth_portal": "html_page",
+            "network_device": "xml_document",
+            "container_api": "json_document",
+            "kubernetes_api": "json_document",
+            "elastic_api": "json_document",
+            "solr_api": "json_document",
+            "config_secret": "config_text",
+            "webshell_probe": "html_page",
         }
         required_kind = self._required_kind_for_path(request.normalized_path)
         default_primary_kind = required_kind or kind_by_intent[intent_family]
@@ -2304,6 +2608,38 @@ class AgenticBundleGenerator(BaseGenerator):
                 "The bundle should give the attacker enough context to keep exploring.",
                 "Every referenced internal path must exist in the generated bundle.",
             ],
+            "auth_portal": [
+                "The bundle should expose a believable authentication or authorization surface.",
+                "Use stateful flow behavior only when request shape or credential form behavior makes it plausible.",
+            ],
+            "network_device": [
+                "The bundle should resemble a management or service-description surface for a network appliance.",
+                "XML/control paths and status pages should share device names, firmware versions, and service labels.",
+            ],
+            "container_api": [
+                "The bundle should present coherent container/runtime or registry resources.",
+                "Repository, image, container, and version names should remain consistent across artifacts.",
+            ],
+            "kubernetes_api": [
+                "The bundle should present coherent cluster API resources.",
+                "Namespaces, nodes, pods, services, UIDs, and timestamps should remain consistent across artifacts.",
+            ],
+            "elastic_api": [
+                "The bundle should present coherent search cluster resources.",
+                "Cluster names, node IDs, index names, health values, and counts should align across artifacts.",
+            ],
+            "solr_api": [
+                "The bundle should present coherent search administration resources.",
+                "Core names, versions, handlers, and status fields should align across artifacts.",
+            ],
+            "config_secret": [
+                "The lure should expose realistic database, cache, mail, token, and internal URL settings.",
+                "Supporting files should reinforce that the configuration came from a live deployment.",
+            ],
+            "webshell_probe": [
+                "The bundle should safely respond to command/upload probes with fixed generated artifacts only.",
+                "Never execute or reflect attacker-supplied commands; serve deterministic content.",
+            ],
         }
         return defaults[intent_family]
 
@@ -2333,6 +2669,38 @@ class AgenticBundleGenerator(BaseGenerator):
             "generic_recon": [
                 "Provide a believable static entry point for further browsing.",
                 "Add at least one adjacent support artifact so the bundle feels contextual.",
+            ],
+            "auth_portal": [
+                "Use realistic labels, field names, authorization challenges, and session-state variants where appropriate.",
+                "Do not apply lockout behavior unless a credential POST form exists.",
+            ],
+            "network_device": [
+                "Use protocol-shaped XML/HTML/status content with coherent device and firmware details.",
+                "Advertised control/action paths should exist inside the bundle when budget allows.",
+            ],
+            "container_api": [
+                "Use parseable JSON and shared repository/image/container/version facts.",
+                "Related list/detail artifacts should refer to the same objects.",
+            ],
+            "kubernetes_api": [
+                "Use parseable API-style JSON and shared cluster resource facts.",
+                "Related artifacts should preserve namespace, node, pod, service, UID, and timestamp consistency.",
+            ],
+            "elastic_api": [
+                "Use parseable JSON or text table artifacts with shared cluster/index/node facts.",
+                "Related artifacts should preserve health, counts, and resource naming consistency.",
+            ],
+            "solr_api": [
+                "Use parseable administration JSON/XML/text artifacts with shared core and handler facts.",
+                "Related artifacts should preserve version, core, and status consistency.",
+            ],
+            "config_secret": [
+                "Expose realistic secret-looking values and infrastructure hostnames.",
+                "Add at least one adjacent support artifact so the leak feels contextual.",
+            ],
+            "webshell_probe": [
+                "Represent command/upload behavior with fixed safe response artifacts.",
+                "Never execute, interpolate, or reflect attacker-supplied commands.",
             ],
         }
         return requirements[intent_family]
@@ -2367,13 +2735,41 @@ class AgenticBundleGenerator(BaseGenerator):
     def _design_guardrails_for_intent(intent_family: str) -> str:
         if intent_family == "config_theft":
             return (
-                "Include the primary leaked configuration file plus at least one adjacent supporting decoy such as a log excerpt, "
-                "backup manifest, or alternate config artifact. Never use internal planning words in served content."
+                "Include the primary leaked configuration file plus at least one companion artifact of kind "
+                "config_text, log_excerpt, backup_manifest, or credential_bait. "
+                "Kinds html_page, robots_txt, sitemap_xml, and stylesheet do NOT satisfy this requirement "
+                "and will cause a hard validation failure. "
+                "Never use internal planning words in served content."
             )
         if intent_family == "cms_probe":
             return (
                 "For WordPress-like login surfaces, include a local stylesheet artifact linked by login HTML pages. "
                 "If you need logos/icons/fonts or other binary assets, either generate artifact.kind='binary_asset' (for synthetic bytes) or use reference_asset_plan.asset_fetches (for copied real assets)."
+            )
+        if intent_family == "config_secret":
+            return (
+                "Include the primary leaked configuration/secret artifact plus at least one adjacent supporting artifact "
+                "such as server status, debug status, robots, backup manifest, or related config. Keep values coherent."
+            )
+        if intent_family == "auth_portal":
+            return (
+                "Plan an authentication or authorization surface. Use first-class flow artifacts for auth challenges, "
+                "session-expired states, or credential POST behavior only where the endpoint shape supports it."
+            )
+        if intent_family == "network_device":
+            return (
+                "Plan protocol-shaped network device resources with coherent device, firmware, service, and control-path facts. "
+                "Prefer XML or service-description artifacts when the requested path suggests protocol discovery."
+            )
+        if intent_family in {"container_api", "kubernetes_api", "elastic_api", "solr_api"}:
+            return (
+                "Plan parseable API artifacts with shared coherence_facts for resource names, IDs, versions, timestamps, and related paths. "
+                "Prefer coherent list/detail support artifacts over isolated responses."
+            )
+        if intent_family == "webshell_probe":
+            return (
+                "Represent command/upload probing with fixed safe response artifacts and request-shape flow conditions where useful. "
+                "Never execute, interpolate, or reflect attacker-supplied commands."
             )
         return "Keep the bundle compact, coherent, and free of internal planning language."
 
@@ -2449,9 +2845,33 @@ class AgenticBundleGenerator(BaseGenerator):
 
         rules: list[FlowRule] = []
 
+        # First-class flow metadata from the ResourcePlan takes precedence over
+        # variant-name conventions. This keeps non-login V2 flows declarative.
+        for planned_artifact in resource_plan.artifacts:
+            if not planned_artifact.path.startswith("/_flow/"):
+                continue
+            if planned_artifact.path not in generated_paths:
+                continue
+            if not planned_artifact.flow_match_path or planned_artifact.flow_response is None:
+                continue
+
+            response = planned_artifact.flow_response
+            if response.artifact_path is None and response.redirect_to is None:
+                response = response.model_copy(update={"artifact_path": planned_artifact.path})
+            rules.append(
+                FlowRule(
+                    match_path=planned_artifact.flow_match_path,
+                    condition=planned_artifact.flow_condition,
+                    response=response,
+                    priority=planned_artifact.flow_priority,
+                )
+            )
+
         # Process explicit /_flow/ variant artifacts first
         for artifact in bundle.artifacts:
             if not artifact.path.startswith("/_flow/"):
+                continue
+            if any(rule.response.artifact_path == artifact.path for rule in rules):
                 continue
             parts = artifact.path.lstrip("/").split("/")
             # expected: ["_flow", slug, variant_name]
@@ -2582,10 +3002,14 @@ class AgenticBundleGenerator(BaseGenerator):
 
         if not rules:
             self.logger.info("flow_designer: no rules produced for this bundle")
-            return {}
+            return {
+                "generated_bundle": bundle.model_copy(update={"flow_descriptor": None}),
+                "flow_descriptor": None,
+                "trace_notes": ["flow_designer:none"],
+            }
 
-        bundle = bundle.model_copy(update={"artifacts": mutable_artifacts})
         descriptor = FlowDescriptor(rules=rules)
+        bundle = bundle.model_copy(update={"artifacts": mutable_artifacts, "flow_descriptor": descriptor})
         self.logger.info(
             "flow_designer: produced %d flow rule(s) for bundle %s",
             len(rules),
@@ -2594,6 +3018,7 @@ class AgenticBundleGenerator(BaseGenerator):
         return {
             "generated_bundle": bundle,
             "flow_descriptor": descriptor.model_dump(),
+            "trace_notes": ["flow_designer:{}".format(len(rules))],
         }
 
     @staticmethod
@@ -2609,7 +3034,10 @@ class AgenticBundleGenerator(BaseGenerator):
         targets: set[str] = set()
         for form_tag in form_tag_re.findall(body_text):
             method_match = method_re.search(form_tag)
-            method = method_match.group(1).strip().upper() if method_match else "GET"
+            # Default to POST when method is absent: login forms without an explicit
+            # method are almost always POST, and defaulting to GET silently causes the
+            # flow_designer to miss forms that the bundle validator will later flag.
+            method = method_match.group(1).strip().upper() if method_match else "POST"
             if method != "POST":
                 continue
 
@@ -2761,6 +3189,17 @@ class AgenticBundleGenerator(BaseGenerator):
                 ),
                 priority=3,
             )
+        if variant_name == "mfa-required":
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(method="POST"),
+                response=FlowResponse(
+                    artifact_path=artifact_path,
+                    status_code=200,
+                    set_cookie={"session_stage": "mfa_required"},
+                ),
+                priority=4,
+            )
         if variant_name == "logout":
             return FlowRule(
                 match_path=parent_path,
@@ -2771,6 +3210,13 @@ class AgenticBundleGenerator(BaseGenerator):
                     clear_cookie=["session_token"],
                 ),
                 priority=5,
+            )
+        if variant_name == "session-expired":
+            return FlowRule(
+                match_path=parent_path,
+                condition=FlowCondition(missing_cookie="session_token"),
+                response=FlowResponse(artifact_path=artifact_path, status_code=200),
+                priority=9,
             )
         return None
 

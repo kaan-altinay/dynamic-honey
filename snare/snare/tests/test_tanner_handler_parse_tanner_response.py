@@ -6,6 +6,28 @@ import shutil
 import os
 import json
 import tempfile
+import sys
+import types
+
+if "bs4" not in sys.modules:
+    fake_bs4 = types.ModuleType("bs4")
+    class _FakeBeautifulSoup:
+        def __init__(self, *args, **kwargs):
+            self.body = self
+        def new_tag(self, *args, **kwargs):
+            return self
+        def append(self, *args, **kwargs):
+            return None
+        def __str__(self):
+            return "<html><body></body></html>"
+    fake_bs4.BeautifulSoup = _FakeBeautifulSoup
+    sys.modules["bs4"] = fake_bs4
+
+if "cssutils" not in sys.modules:
+    fake_cssutils = types.ModuleType("cssutils")
+    fake_cssutils.parseStyle = lambda value: types.SimpleNamespace(cssText=value, color="#000000", keys=lambda: [])
+    sys.modules["cssutils"] = fake_cssutils
+
 import multidict
 from snare.utils.asyncmock import AsyncMock
 from snare.utils.page_path_generator import generate_unique_path
@@ -251,6 +273,57 @@ class TestParseTannerResponse(unittest.TestCase):
         self.assertEqual(self.res1, b"User-agent: *\nDisallow: /private\n")
         self.assertEqual(self.res2["Content-Type"], "text/plain; charset=utf-8")
         self.assertEqual(self.res3, 200)
+
+    def test_save_generated_artifacts_persists_flow_descriptor(self):
+        artifacts = [
+            {
+                "path": "/_flow/manager-html/auth-required",
+                "headers": [{"Content-Type": "text/html; charset=utf-8"}],
+                "body_b64": base64.b64encode(b"<html><body>Authorization required</body></html>").decode("ascii"),
+                "status_code": 200,
+            }
+        ]
+        flow_descriptor = {
+            "rules": [
+                {
+                    "match_path": "/manager/html",
+                    "condition": {"missing_header": "Authorization"},
+                    "response": {
+                        "artifact_path": "/_flow/manager-html/auth-required",
+                        "status_code": 401,
+                    },
+                    "priority": 10,
+                }
+            ]
+        }
+
+        self.loop.run_until_complete(
+            self.handler._save_generated_artifacts(
+                artifacts,
+                "/manager/html",
+                flow_descriptor=flow_descriptor,
+            )
+        )
+
+        flows_path = os.path.join(self.main_page_path, "flows.json")
+        self.assertTrue(os.path.isfile(flows_path))
+        with open(flows_path) as flows_file:
+            flows = json.load(flows_file)
+        self.assertEqual(flows["/manager/html"]["rules"][0]["match_path"], "/manager/html")
+
+    def test_save_generated_artifacts_without_flow_descriptor_does_not_create_flows_file(self):
+        artifacts = [
+            {
+                "path": "/robots.txt",
+                "headers": [{"Content-Type": "text/plain; charset=utf-8"}],
+                "body_b64": base64.b64encode(b"User-agent: *\n").decode("ascii"),
+                "status_code": 200,
+            }
+        ]
+
+        self.loop.run_until_complete(self.handler._save_generated_artifacts(artifacts, "/robots.txt"))
+
+        self.assertFalse(os.path.exists(os.path.join(self.main_page_path, "flows.json")))
 
 
     def tearDown(self):

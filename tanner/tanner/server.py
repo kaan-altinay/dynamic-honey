@@ -238,15 +238,20 @@ class TannerServer:
 
     @staticmethod
     def _extract_host(data):
+        # Prefer Snare's configured page_dir: the domain the honeypot impersonates.
+        # This is the value that gives the LLM meaningful organisational context.
+        page_dir = data.get("page_dir")
+        if isinstance(page_dir, str) and page_dir.strip():
+            return page_dir.strip()
+        # Fall back to Host header, but discard raw IP addresses — they carry
+        # no domain context and degrade generation quality.
         headers = data.get("headers") if isinstance(data, dict) else {}
         if isinstance(headers, dict):
             host = headers.get("Host")
             if isinstance(host, str) and host.strip():
-                return host.split(":")[0]
-
-        peer = data.get("peer") if isinstance(data, dict) else {}
-        if isinstance(peer, dict):
-            return peer.get("ip")
+                host = host.split(":")[0].strip()
+                if host and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+                    return host
         return None
 
     @staticmethod
@@ -259,6 +264,16 @@ class TannerServer:
             "body_b64": body_b64,
             "status_code": artifact.status_code,
         }
+
+    @staticmethod
+    def _serialize_flow_descriptor(flow_descriptor):
+        if flow_descriptor is None:
+            return None
+        if hasattr(flow_descriptor, "model_dump"):
+            return flow_descriptor.model_dump(mode="json")
+        if isinstance(flow_descriptor, dict):
+            return flow_descriptor
+        return None
 
     @staticmethod
     def _deserialize_json_field(raw_value, default):
@@ -318,8 +333,9 @@ class TannerServer:
                 raise ValueError("generated bundle used fallback; persistence is disabled")
 
             artifacts = [self._serialize_generated_artifact(artifact) for artifact in bundle.artifacts]
+            flow_descriptor = self._serialize_flow_descriptor(getattr(bundle, "flow_descriptor", None))
 
-            if self.flows_enabled and self.flow_evaluator is not None and getattr(bundle, "flow_descriptor", None) is not None:
+            if self.flows_enabled and self.flow_evaluator is not None and flow_descriptor is not None:
                 try:
                     self.flow_evaluator.register(bundle.primary_path, bundle.flow_descriptor)
                 except Exception as flow_error:
@@ -336,6 +352,7 @@ class TannerServer:
                     "artifacts": artifacts,
                     "review_summary": bundle.review_summary,
                     "used_fallback": bundle.used_fallback,
+                    "flow_descriptor": flow_descriptor,
                 },
             )
         except Exception as error:
@@ -507,6 +524,7 @@ class TannerServer:
             return web.json_response(response_msg, status=500)
 
         artifacts = self._deserialize_json_field(job_data.get("artifacts"), [])
+        flow_descriptor = self._deserialize_json_field(job_data.get("flow_descriptor"), None)
         response_msg = self._make_response(
             msg={
                 "state": "ready",
@@ -515,6 +533,7 @@ class TannerServer:
                 "artifacts": artifacts,
                 "review_summary": job_data.get("review_summary", ""),
                 "used_fallback": str(job_data.get("used_fallback", "")).lower() == "true",
+                "flow_descriptor": flow_descriptor,
             }
         )
         return web.json_response(response_msg)
