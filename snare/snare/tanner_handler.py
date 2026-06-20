@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import time
 import base64
 import binascii
 import hashlib
@@ -27,6 +29,15 @@ class TannerHandler:
         self.html_handler = HtmlHandler(run_args.no_dorks, run_args.tanner)
         self.logger = logging.getLogger(__name__)
         self._meta_lock = asyncio.Lock()
+        self.flow_descriptors = self._load_persisted_flow_descriptors()
+
+    def _load_persisted_flow_descriptors(self):
+        flows_path = os.path.join(self.dir, "flows.json")
+        try:
+            return self._load_flow_descriptors(flows_path)
+        except (OSError, ValueError) as error:
+            self.logger.warning("Failed to load persisted flow descriptors from %s: %s", flows_path, error)
+            return {}
 
     def create_data(self, request, response_status):
         data = dict(
@@ -52,9 +63,8 @@ class TannerHandler:
             data["path"] = request.path_qs
             if "Cookie" in header:
                 data["cookies"] = {cookie.split("=")[0]: cookie.split("=")[1] for cookie in header["Cookie"].split(";")}
-        page_dir = getattr(self.run_args, "page_dir", None)
-        if isinstance(page_dir, str) and page_dir.strip():
-            data["page_dir"] = page_dir.strip()
+        if self.flow_descriptors:
+            data["flow_descriptors"] = self.flow_descriptors
         return data
 
     async def submit_data(self, data):
@@ -145,7 +155,7 @@ class TannerHandler:
         return parsed_endpoints
 
     async def _request_meta_generate_job(self, requested_path):
-        host = getattr(self.run_args, "page_dir", None)  # page_dir is the configured domain (e.g. example.com)
+        host = getattr(self.run_args, "host_ip", None)
         if not isinstance(host, str) or not host.strip():
             host = None
 
@@ -284,6 +294,51 @@ class TannerHandler:
         with open(temp_flows_path, "w") as flows_file:
             json.dump(updated_flows, flows_file, indent=2, sort_keys=True)
         os.replace(temp_flows_path, flows_path)
+        self.flow_descriptors = updated_flows
+
+    def _write_generation_report(self, message):
+        """Write a per-endpoint generation report JSON alongside meta.json for debugging."""
+        primary_path = message.get("primary_path") or ""
+        # Build a slug from the primary path for use as filename.
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", primary_path.strip("/")) or "root"
+        slug = slug[:120]
+
+        reports_dir = os.path.join(self.dir, "generation_reports")
+        try:
+            os.makedirs(reports_dir, exist_ok=True)
+        except OSError as error:
+            self.logger.warning("Failed to create generation_reports dir: %s", error)
+            return
+
+        artifacts = message.get("artifacts") or []
+        report = {
+            "timestamp": datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat(),
+            "primary_path": primary_path,
+            "used_fallback": message.get("used_fallback", False),
+            "review_summary": message.get("review_summary", ""),
+            "artifact_count": len(artifacts),
+            "artifacts": [
+                {
+                    "path": a.get("path"),
+                    "kind": a.get("kind"),
+                    "bytes": len(base64.b64decode(a["body_b64"])) if isinstance(a.get("body_b64"), str) else None,
+                }
+                for a in artifacts
+                if isinstance(a, dict)
+            ],
+            "generation_trace": message.get("generation_trace") or [],
+            "generation_errors": message.get("generation_errors") or [],
+            "generation_diagnostics": message.get("generation_diagnostics") or [],
+        }
+
+        report_path = os.path.join(reports_dir, "{}.json".format(slug))
+        tmp_path = "{}.tmp".format(report_path)
+        try:
+            with open(tmp_path, "w") as fh:
+                json.dump(report, fh, indent=2, sort_keys=True)
+            os.replace(tmp_path, report_path)
+        except OSError as error:
+            self.logger.warning("Failed to write generation report for %s: %s", primary_path, error)
 
 
     async def _save_generated_artifacts(self, artifacts, requested_path, flow_descriptor=None):
@@ -373,6 +428,7 @@ class TannerHandler:
                         self.logger.warning("Meta job %s could not be persisted: %s", meta_job_id, error)
                         return False
 
+                    self._write_generation_report(message)
                     self.logger.info(
                         "Stored generated meta bundle for path %s with %s artifacts",
                         requested_path,

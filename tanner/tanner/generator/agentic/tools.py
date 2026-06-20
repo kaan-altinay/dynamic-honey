@@ -229,7 +229,7 @@ def web_research(query: str, runtime_config: GeneratorRuntimeConfig) -> Research
         headers={"User-Agent": "TannerAgenticGenerator/1.0"},
     )
     try:
-        with urlopen(request, timeout=runtime_config.role_config("expert").timeout) as response:
+        with urlopen(request, timeout=runtime_config.command_timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
     except Exception:
         return ResearchResult(query=safe_query)
@@ -271,7 +271,7 @@ def fetch_reference_page(url: str, runtime_config: GeneratorRuntimeConfig) -> Re
         return ReferencePage(url=url, final_url=url)
 
     try:
-        with _open_url(url, runtime_config.role_config("design").timeout) as response:
+        with _open_url(url, runtime_config.command_timeout) as response:
             final_url = response.geturl()
             content_type = response.headers.get("Content-Type", "")
             body = response.read(_MAX_REFERENCE_HTML_BYTES).decode("utf-8", errors="replace")
@@ -286,7 +286,7 @@ def fetch_reference_page(url: str, runtime_config: GeneratorRuntimeConfig) -> Re
     stylesheet_candidates = [candidate for candidate in asset_candidates if candidate.kind == "stylesheet"]
     for stylesheet_candidate in stylesheet_candidates[:3]:
         try:
-            with _open_url(stylesheet_candidate.source_url, runtime_config.role_config("design").timeout) as response:
+            with _open_url(stylesheet_candidate.source_url, runtime_config.command_timeout) as response:
                 css_text = response.read(200_000).decode("utf-8", errors="replace")
         except Exception:
             continue
@@ -313,7 +313,7 @@ def fetch_static_asset(
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("unsupported asset URL scheme")
 
-    with _open_url(source_url, runtime_config.role_config("design").timeout) as response:
+    with _open_url(source_url, runtime_config.command_timeout) as response:
         content_type = response.headers.get("Content-Type") or mimetypes.guess_type(source_url)[0] or "application/octet-stream"
         lowered_content_type = content_type.lower()
         if not any(

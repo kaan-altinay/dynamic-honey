@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Iterable
 from urllib.parse import unquote, urlsplit
@@ -230,21 +231,22 @@ def _validate_login_flow_rules(descriptor, login_targets: set[str], artifact_by_
                 "form POST target {} requires at least two distinct POST flow outcomes".format(target)
             )
 
-def _required_primary_kind_for_path(path: str) -> str | None:
+def _allowed_kinds_for_path(path: str) -> set[str] | None:
     lowered = path.lower()
     if lowered == "/robots.txt":
-        return "robots_txt"
+        return {"robots_txt"}
     if lowered == "/sitemap.xml":
-        return "sitemap_xml"
+        return {"sitemap_xml"}
     if lowered.endswith(".xml"):
-        return "xml_document"
+        return {"xml_document"}
     if lowered.endswith(".json"):
-        return "json_document"
+        return {"json_document", "backup_manifest"}
     if lowered.endswith(".txt"):
-        return "plain_text"
+        return {"plain_text", "config_text", "credential_bait", "log_excerpt", "backup_manifest"}
     if lowered.endswith(_BINARY_ASSET_EXTENSIONS):
-        return "binary_asset"
+        return {"binary_asset"}
     return None
+
 
 def _binary_content_type_for_path(path: str) -> str | None:
     lowered = path.lower()
@@ -279,6 +281,16 @@ def _normalize_content_type(content_type: str | None) -> str | None:
     return content_type.split(";", 1)[0].strip().lower()
 
 
+def _parse_content_type(content_type: str | None) -> tuple[str, str] | None:
+    normalized = _normalize_content_type(content_type)
+    if normalized is None or "/" not in normalized:
+        return None
+    top_level, subtype = normalized.split("/", 1)
+    if not top_level or not subtype:
+        return None
+    return top_level, subtype
+
+
 def _content_type_matches(actual: str | None, expected: str | None) -> bool:
     normalized_actual = _normalize_content_type(actual)
     normalized_expected = _normalize_content_type(expected)
@@ -286,13 +298,49 @@ def _content_type_matches(actual: str | None, expected: str | None) -> bool:
         return True
     if normalized_actual == normalized_expected:
         return True
-    # Allow vendor-specific JSON media types such as Spring Boot actuator responses.
-    if normalized_expected == "application/json" and isinstance(normalized_actual, str):
-        if normalized_actual.endswith("+json"):
+
+    parsed_actual = _parse_content_type(actual)
+    parsed_expected = _parse_content_type(expected)
+    if parsed_actual is None or parsed_expected is None:
+        return False
+
+    actual_top_level, actual_subtype = parsed_actual
+    expected_top_level, expected_subtype = parsed_expected
+
+    # Broad generic matching for data serialization formats: if both expected and actual
+    # indicate the same structured syntax (e.g. json, xml, yaml), treat them as compatible.
+    for generic_type in ("json", "xml", "yaml", "yml", "toml", "markdown", "md", "csv"):
+        if generic_type in expected_subtype and generic_type in actual_subtype:
             return True
-    # Allow SOAP/XML media types on endpoints that otherwise accept XML.
-    if normalized_expected == "application/xml" and normalized_actual in {"application/soap+xml", "text/xml"}:
+
+    # Text/plain artifacts (like config_text, plain_text, log_excerpt) can legitimately
+    # be served as various structured text formats in real-world applications.
+    if normalized_expected == "text/plain":
+        if actual_top_level == "text":
+            return True
+        for generic_type in ("json", "xml", "yaml", "yml", "toml", "markdown", "md", "csv"):
+            if generic_type in actual_subtype:
+                return True
+
+    # Otherwise, text artifacts are intentionally liberal: real appliances and frameworks
+    # often label textual handler output as text/html, text/xml, text/css, etc.
+    if expected_top_level == "text" and actual_top_level == "text":
         return True
+
+    # Historical JavaScript MIME types are still common in captured targets.
+    if normalized_expected == "application/javascript":
+        if normalized_actual in {
+            "text/javascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "application/ecmascript",
+        }:
+            return True
+
+    # Rare, but some services emit CSS with an application top-level.
+    if normalized_expected == "text/css" and normalized_actual == "application/css":
+        return True
+
     return False
 
 
@@ -309,7 +357,7 @@ def _expected_content_type_for_kind_and_path(kind: str, path: str) -> str | None
         extension_expected = "text/css"
     elif lowered.endswith(".js"):
         extension_expected = "application/javascript"
-    elif lowered.endswith((".html", ".htm", ".php", ".asp", ".jsp")):
+    elif lowered.endswith((".html", ".htm")):
         extension_expected = "text/html"
     elif lowered.endswith(_BINARY_ASSET_EXTENSIONS):
         extension_expected = _binary_content_type_for_path(path)
@@ -340,6 +388,24 @@ def _expected_content_type_for_kind_and_path(kind: str, path: str) -> str | None
     if kind in kind_overrides_extension:
         return kind_expected
     return extension_expected or kind_expected
+
+
+def _test_expected_content_type_for_kind_and_path_cases():
+    """Inline smoke-check called from tests; not part of the public API."""
+    # server-side script extensions must NOT force text/html — they are dynamic
+    assert _expected_content_type_for_kind_and_path("html_page", "/config/database.php") == "text/html", \
+        "html_page kind should still expect text/html even without extension hint"
+    assert _expected_content_type_for_kind_and_path("config_text", "/config/database.php") == "text/plain", \
+        "config_text at .php must return text/plain via kind_overrides_extension"
+    assert _expected_content_type_for_kind_and_path("plain_text", "/login.asp") == "text/plain", \
+        "plain_text at .asp must return text/plain via kind_overrides_extension"
+    # .html/.htm still map to text/html unconditionally
+    assert _expected_content_type_for_kind_and_path("html_page", "/index.html") == "text/html"
+    assert _expected_content_type_for_kind_and_path("config_text", "/index.html") == "text/plain", \
+        "config_text overrides even .html extension"
+    # unambiguous extensions still enforced
+    assert _expected_content_type_for_kind_and_path("json_document", "/api/data.json") == "application/json"
+    assert _expected_content_type_for_kind_and_path("stylesheet", "/assets/main.css") == "text/css"
 
 
 def _extract_content_type_from_dict_headers(headers: list[dict[str, str]]) -> str | None:
@@ -446,15 +512,10 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
         raise ValidationError("plan must remain static-only unless scripted flows are enabled")
 
     planned_output_count = _planned_output_count(plan)
-    # /_flow/ variants are synthesised by the flow_designer after the plan is committed;
-    # exclude them from the budget limit so the designer is not penalised for declaring them.
-    flow_artifact_count = sum(1 for a in plan.artifacts if a.path.startswith("/_flow/"))
-    non_flow_planned_count = planned_output_count - flow_artifact_count
-    if non_flow_planned_count > runtime_config.max_bundle_artifacts:
+    if planned_output_count > runtime_config.max_bundle_artifacts:
         raise ValidationError("plan exceeds max_bundle_artifacts")
 
-    non_flow_budget_count = plan.bundle_budget_count - flow_artifact_count
-    if non_flow_budget_count > runtime_config.max_bundle_artifacts:
+    if plan.bundle_budget_count > runtime_config.max_bundle_artifacts:
         raise ValidationError("plan bundle budget count exceeds runtime limit")
 
     if plan.bundle_budget_count != planned_output_count:
@@ -482,21 +543,21 @@ def validate_plan(plan: ResourcePlan, request: GenerationRequest, runtime_config
     if request.normalized_path not in normalized_paths:
         raise ValidationError("plan must include the primary requested path")
 
-    required_primary_kind = _required_primary_kind_for_path(request.normalized_path)
-    if required_primary_kind is not None:
+    allowed_primary_kinds = _allowed_kinds_for_path(request.normalized_path)
+    if allowed_primary_kinds is not None:
         primary_artifact = next((artifact for artifact in plan.artifacts if artifact.path == request.normalized_path), None)
         if primary_artifact is None:
             raise ValidationError(
-                "plan must include a generated primary artifact at {} for extension-enforced kind {}".format(
+                "plan must include a generated primary artifact at {} for extension-enforced kinds {}".format(
                     request.normalized_path,
-                    required_primary_kind,
+                    sorted(allowed_primary_kinds),
                 )
             )
-        if primary_artifact.kind != required_primary_kind:
+        if primary_artifact.kind not in allowed_primary_kinds:
             raise ValidationError(
-                "primary requested path {} requires artifact kind {} (got {})".format(
+                "primary requested path {} requires artifact kind in {} (got {})".format(
                     request.normalized_path,
-                    required_primary_kind,
+                    sorted(allowed_primary_kinds),
                     primary_artifact.kind,
                 )
             )
@@ -688,20 +749,20 @@ def validate_artifact_draft(draft: ArtifactDraft, request: GenerationRequest) ->
         raise ValidationError("draft path is not normalized: {}".format(draft.path))
     if not isinstance(draft.content_model, dict) or not draft.content_model:
         raise ValidationError("draft content_model must be a non-empty object")
-    required_primary_kind = _required_primary_kind_for_path(draft.path)
-    if required_primary_kind is not None and draft.kind != required_primary_kind:
+    allowed_kinds = _allowed_kinds_for_path(draft.path)
+    if allowed_kinds is not None and draft.kind not in allowed_kinds:
         raise ValidationError(
-            "draft path {} requires kind {} (got {})".format(
+            "draft path {} requires kind in {} (got {})".format(
                 draft.path,
-                required_primary_kind,
+                sorted(allowed_kinds),
                 draft.kind,
             )
         )
 
     if draft.kind == "json_document":
         document = draft.content_model.get("document")
-        if not isinstance(document, dict) or not document:
-            raise ValidationError("json_document draft must provide non-empty content_model.document object")
+        if not isinstance(document, (dict, list)) or not document:
+            raise ValidationError("json_document draft must provide non-empty content_model.document object or array")
 
     if draft.kind == "plain_text":
         lines = draft.content_model.get("lines")
@@ -983,16 +1044,80 @@ def validate_flow_descriptor(descriptor, bundle_paths: set) -> None:
             bundle_paths,
         )
 
+
+def _flow_condition_signature(condition) -> str:
+    if condition is None:
+        return "{}"
+    return json.dumps(
+        condition.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _flow_response_label(rule) -> str:
+    if rule.response.artifact_path:
+        return "artifact_path={}".format(rule.response.artifact_path)
+    if rule.response.redirect_to:
+        return "redirect_to={}".format(rule.response.redirect_to)
+    return "empty_response"
+
+
+def diagnose_flow_reachability(bundle: GeneratedBundle) -> list[str]:
+    """
+    Return non-blocking diagnostics for V2 flow artifacts/rules that are likely
+    unreachable. These diagnostics are intentionally warnings: generated content
+    should still be persisted so the failed flow shape can be inspected later.
+    """
+    descriptor = getattr(bundle, "flow_descriptor", None)
+    if descriptor is None:
+        return []
+
+    bundle_paths = {artifact.path for artifact in bundle.artifacts}
+    flow_artifact_paths = {path for path in bundle_paths if path.startswith("/_flow/")}
+    referenced_artifact_paths = {
+        rule.response.artifact_path
+        for rule in descriptor.rules
+        if rule.response.artifact_path is not None
+    }
+
+    diagnostics: list[str] = []
+    for path in sorted(flow_artifact_paths - referenced_artifact_paths):
+        diagnostics.append(
+            "flow artifact {} is not served by any flow rule".format(path)
+        )
+
+    sorted_rules = sorted(
+        enumerate(descriptor.rules),
+        key=lambda item: (-item[1].priority, item[0]),
+    )
+    first_rule_by_condition: dict[tuple[str, str], tuple[int, int, str]] = {}
+    for original_index, rule in sorted_rules:
+        key = (rule.match_path, _flow_condition_signature(rule.condition))
+        current_label = _flow_response_label(rule)
+        if key in first_rule_by_condition:
+            prior_index, prior_priority, prior_label = first_rule_by_condition[key]
+            diagnostics.append(
+                "flow rule #{} for {} is shadowed by earlier rule #{} with the same match_path/condition "
+                "(priority {} {}, priority {} {})".format(
+                    original_index + 1,
+                    rule.match_path,
+                    prior_index + 1,
+                    prior_priority,
+                    prior_label,
+                    rule.priority,
+                    current_label,
+                )
+            )
+            continue
+        first_rule_by_condition[key] = (original_index, rule.priority, current_label)
+
+    return diagnostics
 def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime_config: GeneratorRuntimeConfig) -> None:
     normalized_primary = normalize_path(bundle.primary_path, index_page=request.index_page)
     if normalized_primary != request.normalized_path:
         raise ValidationError("bundle primary path must match requested normalized path")
 
-    non_flow_artifact_count = sum(
-        1 for a in bundle.artifacts if not a.path.startswith("/_flow/")
-    )
-    if non_flow_artifact_count > runtime_config.max_bundle_artifacts:
-        raise ValidationError("bundle exceeds max_bundle_artifacts")
 
     _ensure_unique_paths(artifact.path for artifact in bundle.artifacts)
 
@@ -1014,16 +1139,16 @@ def validate_bundle(bundle: GeneratedBundle, request: GenerationRequest, runtime
     if request.normalized_path not in available_paths:
         raise ValidationError("bundle is missing the primary requested artifact")
     flow_descriptor = getattr(bundle, "flow_descriptor", None)
-    required_primary_kind = _required_primary_kind_for_path(request.normalized_path)
-    if required_primary_kind is not None:
+    allowed_primary_kinds = _allowed_kinds_for_path(request.normalized_path)
+    if allowed_primary_kinds is not None:
         primary_artifact = next((artifact for artifact in bundle.artifacts if artifact.path == request.normalized_path), None)
         if primary_artifact is None:
             raise ValidationError("bundle is missing the primary requested artifact")
-        if primary_artifact.kind != required_primary_kind:
+        if primary_artifact.kind not in allowed_primary_kinds:
             raise ValidationError(
-                "bundle primary artifact {} requires kind {} (got {})".format(
+                "bundle primary artifact {} requires kind in {} (got {})".format(
                     request.normalized_path,
-                    required_primary_kind,
+                    sorted(allowed_primary_kinds),
                     primary_artifact.kind,
                 )
             )

@@ -4,12 +4,13 @@ import shutil
 import os
 import asyncio
 import argparse
+import json
+import tempfile
 from yarl import URL
 from aiohttp import HttpVersion
 from aiohttp import web
 from aiohttp.http_parser import RawRequestMessage
 from snare.tanner_handler import TannerHandler
-from snare.utils.page_path_generator import generate_unique_path
 
 
 class TestCreateData(unittest.TestCase):
@@ -18,8 +19,7 @@ class TestCreateData(unittest.TestCase):
         run_args = argparse.ArgumentParser()
         run_args.add_argument("--tanner")
         run_args.add_argument("--page-dir")
-        self.main_page_path = generate_unique_path()
-        os.makedirs(self.main_page_path)
+        self.main_page_path = tempfile.mkdtemp(prefix="snare-create-data-")
         page_dir = self.main_page_path.rsplit("/")[-1]
         args = run_args.parse_args(["--page-dir", page_dir])
         args_dict = vars(args)
@@ -44,7 +44,8 @@ class TestCreateData(unittest.TestCase):
             chunked=None,
             url=URL("http://test_url/"),
         )
-        loop = asyncio.get_event_loop()
+        self.loop = asyncio.new_event_loop()
+        loop = self.loop
         RequestHandler = Mock()
         protocol = RequestHandler()
         self.request = web.Request(
@@ -60,7 +61,7 @@ class TestCreateData(unittest.TestCase):
         self.data = None
         self.expected_data = {
             "method": "POST",
-            "path": "http://test_url/",
+            "path": "/",
             "headers": {
                 "Host": "test_host",
                 "status": 200,
@@ -76,5 +77,28 @@ class TestCreateData(unittest.TestCase):
         self.data = self.handler.create_data(self.request, self.response_status)
         self.assertEqual(self.data, self.expected_data)
 
+    def test_create_data_includes_persisted_flow_descriptors(self):
+        flow_descriptors = {
+            "/admin/login": {
+                "rules": [
+                    {
+                        "match_path": "/admin/login",
+                        "condition": {"method": "POST"},
+                        "response": {"artifact_path": "/_flow/admin-login/post-fail", "status_code": 200},
+                        "priority": 5,
+                    }
+                ]
+            }
+        }
+        with open(os.path.join(self.main_page_path, "flows.json"), "w") as flows_file:
+            json.dump(flow_descriptors, flows_file)
+
+        self.handler = TannerHandler(self.handler.run_args, {}, self.handler.snare_uuid)
+
+        data = self.handler.create_data(self.request, self.response_status)
+
+        self.assertEqual(data["flow_descriptors"], flow_descriptors)
+
     def tearDown(self):
         shutil.rmtree(self.main_page_path)
+        self.loop.close()

@@ -28,7 +28,6 @@ from tanner.generator.agentic.models import (
     ArtifactReferenceContext,
     EndpointSemanticHint,
     ExpertSpec,
-    FetchedAsset,
     GeneratedArtifact,
     GeneratedBundle,
     GenerationRequest,
@@ -59,14 +58,18 @@ from tanner.generator.agentic.validators import (
     ValidationError,
     _is_external_reference,
     _normalize_allowed_paths,
+    diagnose_flow_reachability,
     ensure_generation_request,
+    extract_css_references,
+    extract_html_references,
+    extract_javascript_references,
     infer_intent_family,
     normalize_path,
     validate_artifact_draft,
     validate_artifact_draft_contract,
     validate_bundle,
     validate_plan,
- )
+)
 from tanner.generator.base_generator import BaseGenerator
 
 
@@ -85,9 +88,9 @@ class GraphState(TypedDict, total=False):
     generated_bundle: GeneratedBundle
     trace_notes: Annotated[list[str], operator.add]
     errors: Annotated[list[str], operator.add]
+    generation_diagnostics: Annotated[list[dict], operator.add]
     plan_revision: int
     flow_descriptor: dict | None  # serialized FlowDescriptor when V2 active
-    coherence_bindings: dict[str, str] | None  # V2 only: flat str→str binding table from design
 
 
 class AgenticBundleGenerator(BaseGenerator):
@@ -217,6 +220,24 @@ class AgenticBundleGenerator(BaseGenerator):
         if match is not None:
             return float(match.group(1)) + 0.5
         return self.runtime_config.default_rate_limit_backoff_seconds
+
+    @staticmethod
+    def _diagnostic_event(
+        stage: str,
+        category: str,
+        target: str,
+        message: str,
+        **details,
+    ) -> dict:
+        event = {
+            "stage": stage,
+            "category": category,
+            "target": target,
+            "message": message,
+        }
+        if details:
+            event["details"] = details
+        return event
 
     async def _wait_for_model_slot(self) -> None:
         self._ensure_invoke_primitives()
@@ -755,6 +776,166 @@ class AgenticBundleGenerator(BaseGenerator):
             )
         return generated_assets
 
+    @staticmethod
+    def _bundle_bytes(artifacts: list[GeneratedArtifact]) -> int:
+        return sum(len(artifact.body_bytes) for artifact in artifacts)
+
+    def _referenced_bundle_paths(
+        self,
+        artifact: GeneratedArtifact,
+        *,
+        request: GenerationRequest,
+        artifact_paths: set[str],
+        flow_descriptor: FlowDescriptor | None,
+    ) -> set[str]:
+        if artifact.kind == "html_page":
+            raw_references = extract_html_references(artifact.body_bytes)
+        elif artifact.kind == "stylesheet":
+            raw_references = extract_css_references(artifact.body_bytes)
+        elif artifact.kind == "javascript":
+            raw_references = extract_javascript_references(artifact.body_bytes)
+        else:
+            raw_references = []
+
+        referenced_paths: set[str] = set()
+        for reference in raw_references:
+            candidate = reference.strip()
+            if not candidate or _is_external_reference(candidate):
+                continue
+            normalized = normalize_path(candidate, index_page=request.index_page)
+            if normalized in artifact_paths:
+                referenced_paths.add(normalized)
+
+        if flow_descriptor is None:
+            return referenced_paths
+
+        for rule in flow_descriptor.rules:
+            if rule.match_path != artifact.path:
+                continue
+            if rule.response.artifact_path in artifact_paths:
+                referenced_paths.add(rule.response.artifact_path)
+            redirect_to = rule.response.redirect_to
+            if redirect_to is None:
+                continue
+            normalized_redirect = normalize_path(redirect_to, index_page=request.index_page)
+            if normalized_redirect in artifact_paths:
+                referenced_paths.add(normalized_redirect)
+        return referenced_paths
+
+    def _fit_bundle_to_byte_limit(
+        self,
+        bundle: GeneratedBundle,
+        request: GenerationRequest,
+    ) -> tuple[GeneratedBundle, list[dict]]:
+        original_artifact_count = len(bundle.artifacts)
+        original_total_bytes = self._bundle_bytes(bundle.artifacts)
+        if original_total_bytes <= self.runtime_config.max_bundle_bytes:
+            return bundle, []
+
+        artifact_by_path: dict[str, GeneratedArtifact] = {}
+        for artifact in bundle.artifacts:
+            if artifact.path in artifact_by_path:
+                return bundle, []
+            artifact_by_path[artifact.path] = artifact
+
+        artifact_paths = set(artifact_by_path)
+        flow_descriptor = bundle.flow_descriptor
+        dependency_cache: dict[str, set[str]] = {}
+
+        def dependency_closure(seed_paths: set[str]) -> set[str]:
+            selected_paths: set[str] = set()
+            pending_paths = [path for path in seed_paths if path in artifact_by_path]
+            while pending_paths:
+                path = pending_paths.pop()
+                if path in selected_paths:
+                    continue
+                selected_paths.add(path)
+                dependencies = dependency_cache.get(path)
+                if dependencies is None:
+                    dependencies = self._referenced_bundle_paths(
+                        artifact_by_path[path],
+                        request=request,
+                        artifact_paths=artifact_paths,
+                        flow_descriptor=flow_descriptor,
+                    )
+                    dependency_cache[path] = dependencies
+                for dependency in dependencies:
+                    if dependency not in selected_paths:
+                        pending_paths.append(dependency)
+            return selected_paths
+
+        selected_paths = dependency_closure({bundle.primary_path})
+        selected_total_bytes = sum(len(artifact_by_path[path].body_bytes) for path in selected_paths)
+        if selected_total_bytes > self.runtime_config.max_bundle_bytes:
+            return bundle, []
+
+        flow_paths: set[str] = set()
+        if flow_descriptor is not None:
+            for rule in flow_descriptor.rules:
+                if rule.match_path in artifact_by_path:
+                    flow_paths.add(rule.match_path)
+                if rule.response.artifact_path in artifact_paths:
+                    flow_paths.add(rule.response.artifact_path)
+                redirect_to = rule.response.redirect_to
+                if redirect_to is None:
+                    continue
+                normalized_redirect = normalize_path(redirect_to, index_page=request.index_page)
+                if normalized_redirect in artifact_by_path:
+                    flow_paths.add(normalized_redirect)
+
+        def artifact_priority(artifact: GeneratedArtifact) -> tuple[bool, bool, bool, bool, int, str]:
+            return (
+                artifact.path != bundle.primary_path,
+                artifact.path not in flow_paths,
+                artifact.artifact_scope != "dynamic_endpoint",
+                artifact.kind in {"robots_txt", "sitemap_xml"},
+                len(artifact.body_bytes),
+                artifact.path,
+            )
+
+        remaining_artifacts = sorted(
+            (artifact for artifact in bundle.artifacts if artifact.path not in selected_paths),
+            key=artifact_priority,
+        )
+        for artifact in remaining_artifacts:
+            additional_paths = dependency_closure({artifact.path}) - selected_paths
+            if not additional_paths:
+                continue
+            additional_total_bytes = sum(
+                len(artifact_by_path[path].body_bytes) for path in additional_paths
+            )
+            if selected_total_bytes + additional_total_bytes > self.runtime_config.max_bundle_bytes:
+                continue
+            selected_paths.update(additional_paths)
+            selected_total_bytes += additional_total_bytes
+
+        if len(selected_paths) == original_artifact_count:
+            return bundle, []
+
+        trimmed_bundle = bundle.model_copy(
+            update={
+                "artifacts": [artifact for artifact in bundle.artifacts if artifact.path in selected_paths],
+            }
+        )
+        validate_bundle(trimmed_bundle, request, self.runtime_config)
+        dropped_paths = [
+            artifact.path for artifact in bundle.artifacts if artifact.path not in selected_paths
+        ]
+        diagnostics = [
+            self._diagnostic_event(
+                "bundle",
+                "trimmed_to_byte_limit",
+                request.normalized_path,
+                "trimmed generated bundle to satisfy byte limit",
+                original_artifact_count=original_artifact_count,
+                final_artifact_count=len(trimmed_bundle.artifacts),
+                original_total_bytes=original_total_bytes,
+                final_total_bytes=selected_total_bytes,
+                dropped_paths=dropped_paths,
+            )
+        ]
+        return trimmed_bundle, diagnostics
+
     async def _normalize_request_node(self, state: GraphState):
         request = GenerationRequest.model_validate(state["request"])
         return {
@@ -766,6 +947,7 @@ class AgenticBundleGenerator(BaseGenerator):
             "plan_revision": 0,
             "trace_notes": ["normalized {}".format(request.normalized_path)],
             "errors": [],
+            "generation_diagnostics": [],
         }
 
     async def _expert_node(self, state: GraphState):
@@ -842,6 +1024,17 @@ class AgenticBundleGenerator(BaseGenerator):
         except Exception as error:
             self.logger.info("Falling back to heuristic expert spec for %s: %s", request.normalized_path, error)
             expert_spec = heuristic_spec
+            return {
+                "expert_spec": expert_spec,
+                "trace_notes": ["expert:heuristic:{}".format(expert_spec.intent_family)],
+                "errors": ["expert fallback for {}: {} {}".format(request.normalized_path, error.__class__.__name__, error)],
+                "generation_diagnostics": [
+                    self._diagnostic_event(
+                        "expert", "heuristic_fallback", request.normalized_path,
+                        str(error), exception_type=error.__class__.__name__,
+                    )
+                ],
+            }
 
         return {"expert_spec": expert_spec, "trace_notes": ["expert:{}".format(expert_spec.intent_family)]}
 
@@ -946,27 +1139,6 @@ class AgenticBundleGenerator(BaseGenerator):
             return "auth_portal"
         return infer_intent_family(normalized_path)
 
-
-    @staticmethod
-    def _normalize_coherence_bindings(coherence_facts: dict) -> dict[str, str]:
-        """
-        Flatten coherence_facts into a str→str binding table for V2 coder enforcement.
-
-        Nested dicts/lists are serialized to compact JSON so every binding value is a
-        plain string the coder can echo verbatim.  Only called when enable_scripted_flows
-        is True so V1 code paths are not affected.
-        """
-        bindings: dict[str, str] = {}
-        for key, value in coherence_facts.items():
-            if isinstance(value, str):
-                bindings[key] = value
-            elif isinstance(value, (int, float, bool)):
-                bindings[key] = str(value)
-            elif isinstance(value, (dict, list)):
-                bindings[key] = json.dumps(value, separators=(",", ":"))
-            elif value is not None:
-                bindings[key] = str(value)
-        return bindings
     async def _design_node(self, state: GraphState):
         request = state["request"]
         expert_spec = state["expert_spec"]
@@ -986,13 +1158,47 @@ class AgenticBundleGenerator(BaseGenerator):
                 "review_feedback": [],
                 "plan_revision": plan_revision,
                 "trace_notes": ["design:heuristic:low_confidence:{}:{}".format(heuristic_plan.primary_path, len(heuristic_plan.artifacts))],
-                "coherence_bindings": None,
             }
         reference_pages = await self._design_reference_candidates(request, expert_spec)
         reference_summary = self._summarize_reference_pages(reference_pages)
         compact_reference_summary = self._summarize_reference_pages_compact(reference_pages)
         semantic_hint = self._endpoint_semantic_hint(request.normalized_path) if self.runtime_config.enable_scripted_flows else EndpointSemanticHint()
         semantic_hint_text = self._format_semantic_hint(semantic_hint) if self.runtime_config.enable_scripted_flows else "none (V1 static mode)"
+        # Build prompt fragments that differ between V1 (static) and V2 (scripted-flow).
+        # Keeping V2-only instructions out of V1 prompts prevents the model from setting
+        # static_only=false or planning flow artifacts when neither is permitted.
+        _v2 = self.runtime_config.enable_scripted_flows
+        _flow_system_guidance = (
+            "For scripted-flow mode, keep static_only=false when you intentionally plan stateful "
+            "behavior. "
+            "If the same public path should react differently by method, headers, query parameters, "
+            "POST fields, cookies, history, or content negotiation, make the response variants "
+            "first-class ResourcePlan artifacts under /_flow/<slug>/<variant>. "
+            "For first-class flow artifacts, set flow_match_path, flow_condition, flow_response, and "
+            "flow_priority on that artifact; set flow_response.artifact_path to the flow artifact "
+            "path when the variant should be served. Choose variant names that describe the behavior; "
+            "do not include every possible variant by default. "
+            "flow_response.set_cookie maps cookie-name -> cookie-value strings only. Do not put "
+            "HttpOnly, Path, SameSite, Secure, Max-Age, or Expires inside set_cookie; those are "
+            "cookie attributes, not cookie names. "
+            "Any generated HTML page with a POST credential form must still define executable POST "
+            "behavior on the form action path: the first three invalid submissions serve visible "
+            "invalid-credentials feedback, and subsequent POSTs during the next 60 seconds serve "
+            "visible too-many-attempts/lockout feedback. "
+            "For non-auth API/config/static endpoints, do not invent flow variants unless a "
+            "conditional response is genuinely plausible. "
+            "Set dynamic_candidate=true for public paths that should participate in a stateful "
+            "login/auth flow.\n"
+        ) if _v2 else ""
+        _flow_contract_rule = (
+            "6. V2 first-class flow artifacts under /_flow/ must include flow_match_path and "
+            "flow_response; use flow_condition only when the rule depends on request shape or "
+            "session state\n\n"
+        ) if _v2 else ""
+        _contract_rule_count = "six" if _v2 else "five"
+        _semantic_hint_line = (
+            "Endpoint semantic hints (advisory, V2-only): {}\n\n".format(semantic_hint_text)
+        ) if _v2 else ""
 
         def _build_design_messages(reference_candidates: str):
             return [
@@ -1001,6 +1207,7 @@ class AgenticBundleGenerator(BaseGenerator):
                 "content": (
                     "You are the Design role in a honeypot bundle generator. "
                     "Plan a realistic bundle that satisfies the requested path and its nearby context. "
+                    "{static_mode_rule}\n"
                     "For authentication-like entry points, include a stateful deception flow only when scripted flows are enabled; otherwise model a static first response.\\n\\n"
                     "- At least 2 generated artifacts required (one primary, plus supporting artifacts)\n"
                     "- Up to {max_artifacts} total outputs (generated artifacts + fetched assets)\n"
@@ -1016,18 +1223,11 @@ class AgenticBundleGenerator(BaseGenerator):
                     "- reference_asset_plan.reference_urls: List the selected reference pages used to justify the design\n"
                     "- coherence_facts: For V2 interactive bundles, define reusable names/IDs/versions/timestamps/hostnames/resource names that all artifacts should share. Leave empty only when there is no cross-artifact state to preserve.\n\n"
                     "Default values: render_strategy='deterministic', artifact_scope='static_file', must_exist=true, service_candidate=false. "
-                    "For scripted-flow mode, keep static_only=false when you intentionally plan stateful behavior. "
-                    "Use endpoint semantic hints as advisory context, not as mandatory labels. For discovery/config/status/protocol endpoints, prefer coherent supporting artifacts and shared coherence_facts over isolated one-off pages. "
-                    "If the same public path should react differently by method, headers, query parameters, POST fields, cookies, history, or content negotiation, make the response variants first-class ResourcePlan artifacts under /_flow/<slug>/<variant>. "
-                    "For first-class flow artifacts, set flow_match_path, flow_condition, flow_response, and flow_priority on that artifact; set flow_response.artifact_path to the flow artifact path when the variant should be served. Choose variant names that describe the behavior; do not include every possible variant by default. "
-                    "flow_response.set_cookie maps cookie-name -> cookie-value strings only. Do not put HttpOnly, Path, SameSite, Secure, Max-Age, or Expires inside set_cookie; those are cookie attributes, not cookie names. "
-                    "Any generated HTML page with a POST credential form must still define executable POST behavior on the form action path: the first three invalid submissions serve visible invalid-credentials feedback, and subsequent POSTs during the next 60 seconds serve visible too-many-attempts/lockout feedback. "
-                    "For non-auth API/config/static endpoints, do not invent flow variants unless a conditional response is genuinely plausible. "
-                    "Set dynamic_candidate=true for public paths that should participate in a stateful login/auth flow.\\n"
-                    "{static_mode_rule}"
+                    "{flow_system_guidance}"
                 ).format(
                     max_artifacts=self.runtime_config.max_bundle_artifacts,
                     static_mode_rule=self._static_mode_design_rule(),
+                    flow_system_guidance=_flow_system_guidance,
                 ),
                 },
                 {
@@ -1038,15 +1238,15 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Attacker goal: {goal}\n"
                     "Review feedback: {feedback}\n"
                     "Bundle budget: up to {count} total outputs, {bytes} bytes\n\n"
-                    "Contract rules (must satisfy all six):\n"
+                    "Contract rules (must satisfy all {contract_rule_count}):\n"
                     "1. No duplicate local paths across artifacts and asset_fetches\n"
                     "2. Every depends_on and required_for_artifact_ids value must reference a valid artifact_id in this plan\n"
                     "3. bundle_budget_count must exactly equal (number of artifacts + number of asset_fetches)\n"
                     "4. artifact.kind='asset_file' is forbidden in artifacts; use artifact.kind='binary_asset' for generated bytes or reference_asset_plan.asset_fetches for copied remote assets\n"
                     "5. Extension-kind contract for primary_path: .xml->xml_document (except /sitemap.xml->sitemap_xml), .json->json_document, .txt->plain_text (except /robots.txt->robots_txt), binary extensions (.ico/.jpg/.jpeg/.png/.gif/.webp/.bmp/.svg/.woff/.woff2/.ttf/.otf)->binary_asset\n\n"
-                    "6. V2 first-class flow artifacts under /_flow/ must include flow_match_path and flow_response; use flow_condition only when the rule depends on request shape or session state\n\n"
+                    "{flow_contract_rule}"
                     "Additional planning rule: {rule}\n\n"
-                    "Endpoint semantic hints (advisory, V2-only): {semantic_hint}\n\n"
+                    "{semantic_hint_line}"
                     "Example ResourcePlan for cms_probe intent (for reference only):\n"
                     "{{\n"
                     "  \"primary_path\": \"/wp-admin/login.php\",\n"
@@ -1095,7 +1295,9 @@ class AgenticBundleGenerator(BaseGenerator):
                         bytes=self.runtime_config.max_bundle_bytes,
                         rule=self._design_guardrails_for_intent(expert_spec.intent_family),
                         reference_summary=reference_candidates,
-                        semantic_hint=semantic_hint_text,
+                        contract_rule_count=_contract_rule_count,
+                        flow_contract_rule=_flow_contract_rule,
+                        semantic_hint_line=_semantic_hint_line,
                     ),
                 },
             ]
@@ -1137,17 +1339,26 @@ class AgenticBundleGenerator(BaseGenerator):
                 last_error,
             )
             resource_plan = heuristic_plan
+            return {
+                "resource_plan": resource_plan,
+                "review_feedback": [],
+                "plan_revision": plan_revision,
+                "trace_notes": ["design:heuristic:{}:{}".format(resource_plan.primary_path, len(resource_plan.artifacts))],
+                "errors": ["design fallback for {}: {} {}".format(request.normalized_path, last_error.__class__.__name__ if last_error else "unknown", last_error)],
+                "generation_diagnostics": [
+                    self._diagnostic_event(
+                        "design", "heuristic_fallback", request.normalized_path,
+                        str(last_error) if last_error else "all design attempts failed",
+                        exception_type=last_error.__class__.__name__ if last_error else "unknown",
+                        attempts=len(attempt_payloads),
+                    )
+                ],
+            }
 
-        coherence_bindings = (
-            self._normalize_coherence_bindings(resource_plan.coherence_facts)
-            if self.runtime_config.enable_scripted_flows and resource_plan.coherence_facts
-            else None
-        )
         return {
             "resource_plan": resource_plan,
             "review_feedback": [],
             "plan_revision": plan_revision,
-            "coherence_bindings": coherence_bindings,
             "trace_notes": ["design:{}:{}".format(resource_plan.primary_path, len(resource_plan.artifacts))],
         }
 
@@ -1159,15 +1370,43 @@ class AgenticBundleGenerator(BaseGenerator):
             self.runtime_config.max_review_loops,
         )
         if next_iteration >= max_design_validation_loops:
-            decision = "fallback"
-        else:
-            decision = "revise"
+            # Budget exhausted.  Rather than producing a deterministic fallback
+            # stub, substitute the heuristic plan (which always passes gate
+            # validation) and proceed through the normal reference→coder→review
+            # path so that real LLM-generated content is persisted.
+            request = state.get("request")
+            expert_spec = state.get("expert_spec")
+            if request is None:
+                # Defensive guard: request missing from state — should not occur in
+                # normal operation but can happen in isolated unit tests.  Fall
+                # through to the legacy fallback path so no AttributeError is raised.
+                return {
+                    "design_validation_decision": "fallback",
+                    "design_validation_iteration": next_iteration,
+                    "review_decision": ReviewDecision(decision="fallback", reasons=reasons, required_fixes=reasons),
+                    "review_feedback": reasons,
+                    "trace_notes": ["design_gate:budget_exhausted:no_request_in_state"],
+                }
+            heuristic_plan = self._heuristic_plan(
+                request, expert_spec, state.get("review_feedback", [])
+            )
+            return {
+                "design_validation_decision": "approve",
+                "design_validation_iteration": next_iteration,
+                "resource_plan": heuristic_plan,
+                "review_feedback": reasons,
+                "trace_notes": [
+                    "design_gate:budget_exhausted:heuristic_fallthrough:{}".format(
+                        heuristic_plan.primary_path
+                    )
+                ],
+            }
         return {
-            "design_validation_decision": decision,
+            "design_validation_decision": "revise",
             "design_validation_iteration": next_iteration,
-            "review_decision": ReviewDecision(decision=decision, reasons=reasons, required_fixes=reasons),
+            "review_decision": ReviewDecision(decision="revise", reasons=reasons, required_fixes=reasons),
             "review_feedback": reasons,
-            "trace_notes": ["design_gate:{}".format(decision)],
+            "trace_notes": ["design_gate:revise"],
         }
 
     async def _design_gate_node(self, state: GraphState):
@@ -1332,7 +1571,6 @@ class AgenticBundleGenerator(BaseGenerator):
         resource_plan = state["resource_plan"]
         reference_pack = state.get("reference_pack")
         plan_revision = state.get("plan_revision", 0)
-        coherence_bindings = state.get("coherence_bindings")
         sends = []
         for artifact in resource_plan.artifacts:
             sends.append(
@@ -1345,7 +1583,6 @@ class AgenticBundleGenerator(BaseGenerator):
                         "reference_pack": reference_pack,
                         "pending_artifact": artifact,
                         "plan_revision": plan_revision,
-                        "coherence_bindings": coherence_bindings,
                     },
                 )
             )
@@ -1542,7 +1779,8 @@ class AgenticBundleGenerator(BaseGenerator):
                 "Use format env for .env-like files and php for .php files."
             ),
             "json_document": (
-                "For json_document: Output a realistic machine-readable JSON object in content_model.document. "
+                "For json_document: Output a realistic machine-readable JSON object or array in content_model.document. "
+                "Use an array when the real API legitimately returns a top-level list (e.g. Docker /containers/json). "
                 "Do not embed JSON inside string values and do not wrap JSON in prose or markdown fences."
             ),
             "plain_text": (
@@ -1613,26 +1851,7 @@ class AgenticBundleGenerator(BaseGenerator):
         reference_urls = artifact_reference_context.reference_urls if artifact_reference_context is not None else []
         reference_notes = artifact_reference_context.notes if artifact_reference_context is not None else []
         allowed_paths = sorted(set(allowed_local_asset_paths + allowed_internal_paths))
-        if self.runtime_config.enable_scripted_flows:
-            _v2_bindings = state.get("coherence_bindings")
-            if _v2_bindings:
-                _binding_lines = "\n".join(
-                    "  {}: {}".format(k, v) for k, v in sorted(_v2_bindings.items())
-                )
-                coherence_section = (
-                    "BINDING TABLE — V2 hard constraints. You MUST reproduce these exact values "
-                    "wherever the corresponding entity appears in this artifact. Do not invent "
-                    "alternative spellings, IDs, versions, hostnames, or names for any key "
-                    "listed here:\n" + _binding_lines
-                )
-            else:
-                coherence_section = "none"
-        else:
-            coherence_section = (
-                json.dumps(resource_plan.coherence_facts, sort_keys=True)
-                if resource_plan.coherence_facts
-                else "none"
-            )
+        coherence_facts = json.dumps(resource_plan.coherence_facts, sort_keys=True) if resource_plan.coherence_facts else "none"
         flow_metadata = "none"
         if artifact.flow_match_path or artifact.flow_condition is not None or artifact.flow_response is not None:
             flow_metadata = json.dumps(
@@ -1673,7 +1892,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Flow metadata for this artifact: {flow_metadata}\n\n"
                     "Environment theme: {theme}\n"
                     "Reference pages: {reference_urls}\n"
-                    "{coherence_section}\n"
+                    "Coherence facts to reuse across this bundle: {coherence_facts}\n"
                     "Reference notes: {reference_notes}\n\n"
                     "Paths you MUST reference (from artifact.links_to): {must_reference}\n"
                     "Additional paths you MAY reference (other bundle artifacts/assets): {may_reference}\n"
@@ -1724,7 +1943,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     if artifact.response_contract.headers_hint
                     else "none",
                     theme=expert_spec.environment_theme,
-                    coherence_section=coherence_section,
+                    coherence_facts=coherence_facts,
                     flow_metadata=flow_metadata,
                     reference_urls=", ".join(reference_urls) if reference_urls else "none",
                     reference_notes=" | ".join(reference_notes) if reference_notes else "none",
@@ -1796,6 +2015,18 @@ class AgenticBundleGenerator(BaseGenerator):
                 primary_path=primary_path,
                 forbidden_external_assets=forbidden_external_assets,
             )
+            return {
+                "artifact_drafts": [draft],
+                "trace_notes": ["coder:heuristic:{}".format(draft.path)],
+                "errors": ["coder fallback for {}: {} {}".format(artifact.path, error.__class__.__name__, error)],
+                "generation_diagnostics": [
+                    self._diagnostic_event(
+                        "coder", "heuristic_fallback", artifact.path,
+                        str(error), exception_type=error.__class__.__name__,
+                        artifact_kind=artifact.kind,
+                    )
+                ],
+            }
 
         return {
             "artifact_drafts": [draft],
@@ -1835,21 +2066,32 @@ class AgenticBundleGenerator(BaseGenerator):
         resource_plan = state["resource_plan"]
         bundle = GeneratedBundle.model_validate(state["generated_bundle"])
         issues = list(state.get("errors", []))
+        hard_failures: list[str] = []
         flow_dict = state.get("flow_descriptor")
         if flow_dict is not None and bundle.flow_descriptor is None:
             try:
                 bundle = bundle.model_copy(update={"flow_descriptor": FlowDescriptor.model_validate(flow_dict)})
             except Exception as error:
-                issues.append("invalid flow descriptor: {}".format(error))
+                message = "invalid flow descriptor: {}".format(error)
+                issues.append(message)
+                hard_failures.append(message)
 
+        trim_diagnostics: list[dict] = []
         try:
+            bundle, trim_diagnostics = self._fit_bundle_to_byte_limit(bundle, request)
             validate_plan(resource_plan, request, self.runtime_config)
             validate_bundle(bundle, request, self.runtime_config)
         except ValidationError as error:
-            issues.append(str(error))
+            message = str(error)
+            issues.append(message)
+            hard_failures.append(message)
 
         if issues:
-            return self._review_revise_or_fallback(state, issues)
+            return self._review_revise_or_fallback(
+                state,
+                issues,
+                hard_failure=bool(hard_failures),
+            )
 
         review_evidence = self._build_review_evidence(bundle)
         flow_evidence = self._build_flow_evidence(bundle)
@@ -1867,7 +2109,7 @@ class AgenticBundleGenerator(BaseGenerator):
                     "Deterministic validators have already confirmed:\n"
                     "- Structural integrity: primary path exists, all internal references resolve\n"
                     "- Safety: no external asset links, no duplicate paths\n"
-                    "- Budget compliance: artifact count and byte limits satisfied\n\n"
+                    "- Budget compliance: byte limits satisfied\n\n"
                     "Your role is to evaluate QUALITY defects the validators cannot detect.\n\n"
                     "You have veto power over these specific defect categories:\n"
                     "1. PLACEHOLDER_CONTENT: Artifact contains obvious placeholder text (lorem ipsum, 'example', 'test', 'TODO', '<placeholder>')\n"
@@ -1940,18 +2182,63 @@ class AgenticBundleGenerator(BaseGenerator):
             )
 
         trace_decision = decision.decision if decision.decision == "approve" else "quality_defect:{}".format(decision.decision)
-        return {"review_decision": decision, "trace_notes": ["review:{}".format(trace_decision)]}
-
-    def _review_revise_or_fallback(self, state: GraphState, reasons: list[str]):
-        next_iteration = state.get("review_iteration", 0) + 1
-        if next_iteration >= self.runtime_config.max_review_loops:
-            retain_reason = (
-                "review loop budget exhausted after {} iteration(s); retaining latest generated artifacts".format(
-                    next_iteration
+        extra: dict = {
+            "generated_bundle": bundle,
+            "review_decision": decision,
+            "trace_notes": ["review:{}".format(trace_decision)],
+        }
+        diagnostics = list(trim_diagnostics)
+        if review_source == "deterministic":
+            extra["errors"] = [
+                "review deterministic fallback for {}: {} {}".format(
+                    request.normalized_path,
+                    "error" if "error" not in str(reviewer_output) else reviewer_output,
+                    "(model call failed)",
+                )
+            ]
+            diagnostics.append(
+                self._diagnostic_event(
+                    "review", "deterministic_fallback", request.normalized_path,
+                    "model review call failed; deterministic approval applied",
                 )
             )
-            decision = ReviewDecision(decision="approve", reasons=[retain_reason] + reasons, required_fixes=[])
-            route = "approve"
+        elif decision.decision != "approve":
+            diagnostics.append(
+                self._diagnostic_event(
+                    "review", "quality_rejection", request.normalized_path,
+                    "; ".join(decision.reasons[:3]),
+                    required_fixes=decision.required_fixes[:3],
+                )
+            )
+        if diagnostics:
+            extra["generation_diagnostics"] = diagnostics
+        return extra
+
+    def _review_revise_or_fallback(
+        self,
+        state: GraphState,
+        reasons: list[str],
+        *,
+        hard_failure: bool = False,
+    ):
+        next_iteration = state.get("review_iteration", 0) + 1
+        if next_iteration >= self.runtime_config.max_review_loops:
+            if hard_failure:
+                retain_reason = (
+                    "review loop budget exhausted after {} iteration(s); falling back because structural validation failed".format(
+                        next_iteration
+                    )
+                )
+                decision = ReviewDecision(decision="fallback", reasons=[retain_reason] + reasons, required_fixes=[])
+                route = "fallback"
+            else:
+                retain_reason = (
+                    "review loop budget exhausted after {} iteration(s); retaining latest generated artifacts".format(
+                        next_iteration
+                    )
+                )
+                decision = ReviewDecision(decision="approve", reasons=[retain_reason] + reasons, required_fixes=[])
+                route = "approve"
         else:
             decision = ReviewDecision(decision="revise", reasons=reasons, required_fixes=reasons)
             route = "revise"
@@ -2000,9 +2287,32 @@ class AgenticBundleGenerator(BaseGenerator):
                     review_decision.decision if review_decision else bundle.review_summary
                 ),
                 "flow_descriptor": flow_descriptor,
+                "generation_trace": list(state.get("trace_notes", [])) + ["finalized"],
+                "generation_errors": list(state.get("errors", [])),
+                "generation_diagnostics": list(state.get("generation_diagnostics", [])),
             }
         )
+        finalized, trim_diagnostics = self._fit_bundle_to_byte_limit(finalized, request)
+        if trim_diagnostics:
+            finalized = finalized.model_copy(
+                update={
+                    "generation_diagnostics": finalized.generation_diagnostics + trim_diagnostics,
+                }
+            )
         validate_bundle(finalized, request, self.runtime_config)
+        flow_reachability_diagnostics = diagnose_flow_reachability(finalized)
+        if flow_reachability_diagnostics:
+            diagnostic_summary = "; ".join(
+                "FLOW_REACHABILITY_WARNING: {}".format(diagnostic)
+                for diagnostic in flow_reachability_diagnostics
+            )
+            finalized = finalized.model_copy(
+                update={
+                    "review_summary": "{}; {}".format(finalized.review_summary, diagnostic_summary)
+                    if finalized.review_summary
+                    else diagnostic_summary,
+                }
+            )
         return {"generated_bundle": finalized, "trace_notes": ["finalized"]}
 
     async def _fallback_node(self, state: GraphState):
@@ -2015,6 +2325,18 @@ class AgenticBundleGenerator(BaseGenerator):
             expert_spec=expert_spec,
             reasons=reasons,
             max_artifacts=self.runtime_config.max_bundle_artifacts,
+        )
+        bundle = bundle.model_copy(
+            update={
+                "generation_trace": list(state.get("trace_notes", [])) + ["fallback"],
+                "generation_errors": list(state.get("errors", [])),
+                "generation_diagnostics": list(state.get("generation_diagnostics", [])) + [
+                    self._diagnostic_event(
+                        "fallback_node", "final_fallback", request.normalized_path,
+                        "; ".join(reasons[:5]),
+                    )
+                ],
+            }
         )
         validate_bundle(bundle, request, self.runtime_config)
         return {"generated_bundle": bundle, "trace_notes": ["fallback"]}
@@ -2735,11 +3057,8 @@ class AgenticBundleGenerator(BaseGenerator):
     def _design_guardrails_for_intent(intent_family: str) -> str:
         if intent_family == "config_theft":
             return (
-                "Include the primary leaked configuration file plus at least one companion artifact of kind "
-                "config_text, log_excerpt, backup_manifest, or credential_bait. "
-                "Kinds html_page, robots_txt, sitemap_xml, and stylesheet do NOT satisfy this requirement "
-                "and will cause a hard validation failure. "
-                "Never use internal planning words in served content."
+                "Include the primary leaked configuration file plus at least one adjacent supporting decoy such as a log excerpt, "
+                "backup manifest, or alternate config artifact. Never use internal planning words in served content."
             )
         if intent_family == "cms_probe":
             return (
@@ -3034,10 +3353,7 @@ class AgenticBundleGenerator(BaseGenerator):
         targets: set[str] = set()
         for form_tag in form_tag_re.findall(body_text):
             method_match = method_re.search(form_tag)
-            # Default to POST when method is absent: login forms without an explicit
-            # method are almost always POST, and defaulting to GET silently causes the
-            # flow_designer to miss forms that the bundle validator will later flag.
-            method = method_match.group(1).strip().upper() if method_match else "POST"
+            method = method_match.group(1).strip().upper() if method_match else "GET"
             if method != "POST":
                 continue
 
@@ -3255,6 +3571,23 @@ class AgenticBundleGenerator(BaseGenerator):
         lower = path.lower()
         return any(kw in lower for kw in ("admin", "dashboard", "portal", "panel", "control", "manage"))
 
+    @staticmethod
+    async def _probe_internet_connectivity(timeout: float = 3.0) -> bool:
+        """Return True if a basic TCP route to the internet is reachable."""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("1.1.1.1", 53),
+                timeout=timeout,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     async def generate_bundle(self, host, path, site_profile):
         request = ensure_generation_request(host, path, site_profile if isinstance(site_profile, dict) else {})
         initial_state: GraphState = {
@@ -3266,10 +3599,18 @@ class AgenticBundleGenerator(BaseGenerator):
             "design_validation_decision": "approve",
             "trace_notes": [],
             "errors": [],
+            "generation_diagnostics": [],
             "plan_revision": 0,
         }
         thread_id = "meta:{}:{}".format(request.normalized_path, uuid.uuid4())
 
+        if self.runtime_config.enable_live_research:
+            if not await self._probe_internet_connectivity():
+                self.logger.warning(
+                    "Internet connectivity check failed for %s — web research will be skipped "
+                    "and LLM API calls may also fail. Check network connectivity on this host.",
+                    request.normalized_path,
+                )
         try:
             async with AsyncSqliteSaver.from_conn_string(self.runtime_config.checkpoint_path) as checkpointer:
                 if not hasattr(checkpointer.conn, "is_alive"):

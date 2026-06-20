@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 IntentFamily = Literal[
@@ -202,7 +202,30 @@ class SitemapContent(ModelBase):
     urls: list[str] = Field(default_factory=list)
 
 class JsonDocumentContent(ModelBase):
-    document: dict[str, Any] = Field(default_factory=dict)
+    """Wraps an arbitrary JSON document.
+
+    Real-world JSON APIs this models (Docker, Kubernetes, search engines, ...)
+    legitimately return either a top-level object or a top-level array, and
+    LLM-produced drafts sometimes place document fields as siblings of
+    ``document`` instead of nesting them. Coalesce both cases before
+    field validation rather than rejecting otherwise-correct content.
+    """
+
+    document: dict[str, Any] | list[Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coalesce_document(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"document": data}
+        if isinstance(data, dict):
+            nested = data.get("document")
+            extra = {key: value for key, value in data.items() if key != "document"}
+            if extra and isinstance(nested, dict):
+                return {"document": {**extra, **nested}}
+            if extra and nested is None:
+                return {"document": extra}
+        return data
 
 
 class BinaryAssetContent(ModelBase):
@@ -458,6 +481,9 @@ class GeneratedBundle(ModelBase):
     review_summary: str
     used_fallback: bool = False
     flow_descriptor: FlowDescriptor | None = None
+    generation_trace: list[str] = Field(default_factory=list)
+    generation_errors: list[str] = Field(default_factory=list)
+    generation_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StructuredReviewDecision(ModelBase):

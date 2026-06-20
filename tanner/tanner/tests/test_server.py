@@ -110,6 +110,8 @@ class TestServer(AioHTTPTestCase):
         async def _add_or_update_mock(data, client):
             sess = mock.Mock()
             sess.set_attack_type = mock.Mock()
+            sess.cookies = {}
+            sess.paths = []
             sess_id = hashlib.md5(b"foo")
             test_uuid = uuid
             sess.get_uuid = mock.Mock(return_value=str(self.test_uuid))
@@ -153,7 +155,7 @@ class TestServer(AioHTTPTestCase):
         text = await request.text()
         assert "Tanner server" in text
 
-    def test_meta_policy_blocks_ua_only_signal(self):
+    def test_meta_policy_blocks_scanner_ua_without_other_signals(self):
         policy = server.MetaGenerationPolicy(mock.Mock())
         allowed, reason = policy.should_generate(
             path="/probe",
@@ -162,7 +164,7 @@ class TestServer(AioHTTPTestCase):
             user_agent="CensysInspect/1.1",
         )
         self.assertFalse(allowed)
-        self.assertEqual(reason, "ua_only_positive")
+        self.assertEqual(reason, "no_positive_signal")
 
     def test_meta_policy_allows_high_value_signal(self):
         policy = server.MetaGenerationPolicy(mock.Mock())
@@ -201,6 +203,30 @@ class TestServer(AioHTTPTestCase):
         detection = await request.json()
         self.assertDictEqual(detection, detection_assert)
 
+
+    @unittest_run_loop
+    async def test_event_registers_persisted_flow_descriptors_before_evaluation(self):
+        self.serv.flows_enabled = True
+        self.serv.flow_evaluator = server.FlowEvaluator()
+        self.serv._registered_flow_descriptor_fingerprints = {}
+
+        event_payload = (
+            b'{"path":"/admin/login","method":"POST","headers":{},'
+            b'"flow_descriptors":{"/admin/login":{"rules":[{"match_path":"/admin/login",'
+            b'"condition":{"method":"POST"},'
+            b'"response":{"artifact_path":"/_flow/admin-login/post-fail","status_code":200},'
+            b'"priority":5}]}}}'
+        )
+
+        request = await self.client.request("POST", "/event", data=event_payload)
+
+        self.assertEqual(request.status, 200)
+        response = await request.json()
+        detection = response["response"]["message"]["detection"]
+        self.assertEqual(detection["type"], 4)
+        self.assertEqual(detection["payload"]["rewritten_path"], "/_flow/admin-login/post-fail")
+        self.assertIn("/admin/login", self.serv.flow_evaluator._flows)
+        self.assertIn("/admin/login", self.serv._registered_flow_descriptor_fingerprints)
 
     @unittest_run_loop
     async def test_meta_generate_request(self):

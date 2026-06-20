@@ -338,6 +338,11 @@ FALLBACK_PROFILES: dict[str, FallbackProfile] = {
 INTENT_TO_FALLBACK_PROFILE = {
     "cms_probe": "cms_probe",
     "config_theft": "config_theft",
+    # V2's _v2_intent_family() splits config_theft into a more specific
+    # "config_secret" label for .env/.git-config-style leaks; both need the
+    # same config/log/backup support-artifact bundle, and validate_bundle's
+    # config_theft gate is keyed off the legacy path-based classification.
+    "config_secret": "config_theft",
 }
 
 

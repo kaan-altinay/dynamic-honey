@@ -24,7 +24,7 @@ FAMILY_VALUES = {
         "description": "Bundle size budget",
         "axes": {
             "max_bundle_artifacts": [5, 8],
-            "max_bundle_bytes": [1_048_576, 2_000_000, 4_000_000],
+            "max_bundle_bytes": [1_000_000, 2_000_000, 4_000_000],
         },
     },
     "B": {
@@ -52,26 +52,28 @@ FAMILY_VALUES = {
     },
 }
 
-# Ordered axis keys per family — same ordering used in run_param_tuning.py.
+DEFAULT_ENDPOINTS = [
+    "/boaform/admin/formLogin",
+    "/api/v1/pods",
+    "/containers/json",
+    "/.env",
+]
+# Must match _EXIT_RATE_LIMITED in run_param_tuning.py.
+_EXIT_RATE_LIMITED = 2
+
 _FAMILY_SLUG_AXES: dict[str, list[str]] = {
-    family: list(defn["axes"].keys())
-    for family, defn in FAMILY_VALUES.items()
+    family: list(definition["axes"].keys())
+    for family, definition in FAMILY_VALUES.items()
 }
 
 
-def _format_param_value(val) -> str:
-    if isinstance(val, float):
-        return str(val).replace(".", "p")
-    return str(val)
+def _format_param_value(value) -> str:
+    if isinstance(value, float):
+        return str(value).replace(".", "p")
+    return str(value)
 
 
 def _params_slug_for_family(family: str, params: dict) -> str:
-    """
-    Build the params_<slug> directory name for a given family and parameter dict.
-
-    BASE (baseline) always maps to 'params_baseline'.
-    Other families use the ordered axis values for that family joined by '_'.
-    """
     if family == "BASE":
         return "params_baseline"
     axes = _FAMILY_SLUG_AXES.get(family, [])
@@ -79,29 +81,58 @@ def _params_slug_for_family(family: str, params: dict) -> str:
     return "params_" + "_".join(parts)
 
 
-def _next_family_run_dir(run_root: Path, family: str) -> Path:
-    """
-    Create and return the next runs/family_<FAMILY>/run<N>/ directory.
-
-    Increments the run counter over existing siblings so multiple matrix
-    executions for the same family never collide.
-    """
-    family_dir = run_root / f"family_{family}"
-    family_dir.mkdir(parents=True, exist_ok=True)
-    max_n = 0
-    for child in family_dir.iterdir():
-        if not child.is_dir():
-            continue
-        match = re.fullmatch(r"run(\d+)", child.name)
-        if match:
-            max_n = max(max_n, int(match.group(1)))
-    run_dir = family_dir / f"run{max_n + 1}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir
-
-
 def _combo_key(params: dict) -> tuple:
     return tuple((key, params[key]) for key in sorted(BASELINE))
+
+
+def _family_run_dir(run_root: Path, family: str, run_name: str) -> Path:
+    return run_root / f"family_{family}" / run_name
+
+
+def _next_run_name(run_root: Path) -> str:
+    run_root.mkdir(parents=True, exist_ok=True)
+    max_n = 0
+    pattern = re.compile(r"run(\d+)$")
+    for family_dir in run_root.iterdir():
+        if not family_dir.is_dir() or not family_dir.name.startswith("family_"):
+            continue
+        for child in family_dir.iterdir():
+            if not child.is_dir():
+                continue
+            match = pattern.fullmatch(child.name)
+            if match:
+                max_n = max(max_n, int(match.group(1)))
+    return f"run{max_n + 1}"
+
+
+def _matrix_manifest_path(run_root: Path, run_name: str) -> Path:
+    return run_root / f"matrix_{run_name}.json"
+
+
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def _params_run_complete(params_dir: Path, endpoints: list[str]) -> bool:
+    progress = _read_json(params_dir / "run_state.json")
+    if progress is None:
+        progress = _read_json(params_dir / "run_config.json")
+        if progress is None:
+            return False
+        results = list(progress.get("results", []))
+        complete = True
+    else:
+        results = list(progress.get("results", []))
+        complete = bool(progress.get("complete"))
+
+    saved_endpoints = progress.get("endpoints") or endpoints
+    if len(results) != len(saved_endpoints):
+        return False
+    if not complete:
+        return False
+    return all(summary.get("endpoint") == endpoint for summary, endpoint in zip(results, saved_endpoints))
 
 
 def build_plan(families: list[str]) -> list[dict]:
@@ -121,8 +152,8 @@ def build_plan(families: list[str]) -> list[dict]:
     )
 
     for family in families:
-        family_def = FAMILY_VALUES[family]
-        for axis_name, axis_values in family_def["axes"].items():
+        family_definition = FAMILY_VALUES[family]
+        for axis_name, axis_values in family_definition["axes"].items():
             for value in axis_values:
                 if value == BASELINE[axis_name]:
                     continue
@@ -135,13 +166,12 @@ def build_plan(families: list[str]) -> list[dict]:
                 plan.append(
                     {
                         "family": family,
-                        "family_description": family_def["description"],
+                        "family_description": family_definition["description"],
                         "varied_param": axis_name,
                         "params_slug": _params_slug_for_family(family, params),
                         "params": params,
                     }
                 )
-
     return plan
 
 
@@ -174,76 +204,116 @@ def print_plan(plan: list[dict]) -> None:
         )
 
 
-def run_plan(plan: list[dict], args) -> None:
+def _write_matrix_manifest(plan: list[dict], args, run_root: Path, run_name: str, endpoints: list[str]) -> None:
+    manifest = {
+        "run_name": run_name,
+        "run_root": str(run_root),
+        "page_url": args.page_url,
+        "model_name": args.model_name,
+        "families": args.families,
+        "endpoints": endpoints,
+        "plan": [
+            {
+                **entry,
+                "family_run_dir": str(_family_run_dir(run_root, entry["family"], run_name)),
+                "params_dir": str(_family_run_dir(run_root, entry["family"], run_name) / entry["params_slug"]),
+            }
+            for entry in plan
+        ],
+    }
+    _matrix_manifest_path(run_root, run_name).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def run_plan(plan: list[dict], args, run_name: str) -> None:
     script_path = Path(__file__).resolve().parent / "run_param_tuning.py"
     run_root = Path(args.run_root).resolve()
+    endpoints = list(DEFAULT_ENDPOINTS)
 
-    # Pre-create one family/run<N>/ directory per family so that all parameter
-    # configurations in the same matrix execution share a common run counter.
     family_run_dirs: dict[str, Path] = {}
     for entry in plan:
         family = entry["family"]
-        if family not in family_run_dirs:
-            family_run_dirs[family] = _next_family_run_dir(run_root, family)
+        if family in family_run_dirs:
+            continue
+        family_run_dir = _family_run_dir(run_root, family, run_name)
+        family_run_dir.mkdir(parents=True, exist_ok=args.resume)
+        family_run_dirs[family] = family_run_dir
+
+    _write_matrix_manifest(plan, args, run_root, run_name, endpoints)
 
     for idx, entry in enumerate(plan, start=1):
         params = entry["params"]
         family = entry["family"]
         family_run_dir = family_run_dirs[family]
         params_slug = entry["params_slug"]
+        params_dir = family_run_dir / params_slug
+
+        if args.resume and _params_run_complete(params_dir, endpoints):
+            print(f"\n=== SKIP {idx}/{len(plan)} family={family} dir={family_run_dir.name}/{params_slug} (complete) ===")
+            continue
 
         cmd = [
             sys.executable,
             str(script_path),
-            "--model-name", args.model_name,
-            "--page-url", args.page_url,
-            "--device-endpoint", args.device_endpoint,
-            "--family", family,
-            "--family-run-dir", str(family_run_dir),
-            "--params-slug", params_slug,
-            "--max-bundle-artifacts", str(params["max_bundle_artifacts"]),
-            "--max-bundle-bytes", str(params["max_bundle_bytes"]),
-            "--expert-temperature", str(params["expert_temperature"]),
-            "--design-temperature", str(params["design_temperature"]),
-            "--coder-temperature", str(params["coder_temperature"]),
-            "--review-temperature", str(params["review_temperature"]),
-            "--design-max-tokens", str(params["design_max_tokens"]),
-            "--coder-max-tokens", str(params["coder_max_tokens"]),
-            "--max-review-loops", str(params["max_review_loops"]),
-            "--max-design-validation-loops", str(params["max_design_validation_loops"]),
+            "--model-name",
+            args.model_name,
+            "--page-url",
+            args.page_url,
+            "--family",
+            family,
+            "--family-run-dir",
+            str(family_run_dir),
+            "--params-slug",
+            params_slug,
+            "--max-bundle-artifacts",
+            str(params["max_bundle_artifacts"]),
+            "--max-bundle-bytes",
+            str(params["max_bundle_bytes"]),
+            "--expert-temperature",
+            str(params["expert_temperature"]),
+            "--design-temperature",
+            str(params["design_temperature"]),
+            "--coder-temperature",
+            str(params["coder_temperature"]),
+            "--review-temperature",
+            str(params["review_temperature"]),
+            "--design-max-tokens",
+            str(params["design_max_tokens"]),
+            "--coder-max-tokens",
+            str(params["coder_max_tokens"]),
+            "--max-review-loops",
+            str(params["max_review_loops"]),
+            "--max-design-validation-loops",
+            str(params["max_design_validation_loops"]),
         ]
+        if args.resume:
+            cmd.append("--resume")
+
         print(f"\n=== RUN {idx}/{len(plan)} family={family} dir={family_run_dir.name}/{params_slug} ===")
         print(" ".join(cmd))
-        subprocess.run(cmd, check=True)
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode == _EXIT_RATE_LIMITED:
+            print(
+                f"Matrix stopped: rate limit hit during {family}/{params_slug}. "
+                f"Resume with --resume --run-name {run_name} when quota recovers.",
+                file=sys.stderr,
+            )
+            sys.exit(_EXIT_RATE_LIMITED)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+    print(f"\n=== MATRIX COMPLETE: {run_name} ({len(plan)} run(s)) ===")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Generate a one-parameter-at-a-time V2 parameter tuning matrix."
-    )
-    parser.add_argument(
-        "--families",
-        default="A,B,C,D",
-        help="Comma-separated subset of families to run (default: A,B,C,D).",
-    )
+    parser = argparse.ArgumentParser(description="Generate a one-parameter-at-a-time V2 parameter tuning matrix.")
+    parser.add_argument("--families", default="A,B,C,D", help="Comma-separated subset of families to run (default: A,B,C,D)")
     parser.add_argument("--model-name", default="gpt-5.4")
     parser.add_argument("--page-url", default="example.com")
-    parser.add_argument("--device-endpoint", default="/wsman")
-    parser.add_argument(
-        "--run-root",
-        default=str(Path(__file__).resolve().parent / "runs"),
-        help="Root directory for all run output. Defaults to param_tuning/runs/.",
-    )
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Actually execute the matrix. Default is plan-only (dry run).",
-    )
-    parser.add_argument(
-        "--write-plan",
-        action="store_true",
-        help="Write the generated matrix plan to <run-root>/param_matrix_plan.json.",
-    )
+    parser.add_argument("--device-endpoint", default=None, help="Ignored; retained for backward compatibility.")
+    parser.add_argument("--run-root", default=str(Path(__file__).resolve().parent / "runs"))
+    parser.add_argument("--run-name", default=None, help="Matrix execution name, e.g. run2. Auto-assigned when omitted.")
+    parser.add_argument("--resume", action="store_true", help="Resume an interrupted matrix execution. Requires --run-name.")
+    parser.add_argument("--execute", action="store_true", help="Actually execute the matrix. Default is plan-only.")
+    parser.add_argument("--write-plan", action="store_true", help="Write the generated matrix plan to param_matrix_plan.json.")
     return parser.parse_args()
 
 
@@ -253,21 +323,26 @@ def main() -> int:
     invalid = [family for family in families if family not in FAMILY_VALUES]
     if invalid:
         raise SystemExit(f"Unknown family ids: {', '.join(invalid)}")
+    if args.resume and not args.run_name:
+        raise SystemExit("--resume requires --run-name")
 
     plan = build_plan(families)
     print_plan(plan)
 
+    run_root = Path(args.run_root).resolve()
     if args.write_plan:
-        plan_path = Path(args.run_root).resolve() / "param_matrix_plan.json"
+        plan_path = run_root / "param_matrix_plan.json"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
         print(f"Plan written to: {plan_path}")
 
     if args.execute:
-        run_plan(plan, args)
+        run_name = args.run_name or _next_run_name(run_root)
+        _write_matrix_manifest(plan, args, run_root, run_name, list(DEFAULT_ENDPOINTS))
+        print(f"Matrix run name: {run_name}")
+        run_plan(plan, args, run_name)
     else:
         print("\nPlan only. Re-run with --execute to launch all runs.")
-
     return 0
 
 

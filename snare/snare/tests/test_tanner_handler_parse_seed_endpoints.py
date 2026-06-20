@@ -97,6 +97,70 @@ class TestParseSeedEndpoints(unittest.TestCase):
             self.assertEqual(content_file.read(), b"User-agent: *\nDisallow: /private\n")
 
 
+    def test_write_generation_report_creates_json_in_generation_reports_dir(self):
+        message = {
+            "primary_path": "/actuator/health",
+            "used_fallback": False,
+            "review_summary": "approved by model",
+            "artifacts": [
+                {
+                    "path": "/actuator/health",
+                    "kind": "json_document",
+                    "body_b64": base64.b64encode(b'{"status":"UP"}').decode("ascii"),
+                }
+            ],
+            "generation_trace": ["normalized /actuator/health", "expert:elastic_api", "finalized"],
+            "generation_errors": [],
+            "generation_diagnostics": [],
+        }
+
+        self.handler._write_generation_report(message)
+
+        report_path = os.path.join(self.temp_dir, "generation_reports", "actuator-health.json")
+        self.assertTrue(os.path.exists(report_path))
+        with open(report_path) as fh:
+            report = json.load(fh)
+        self.assertEqual(report["primary_path"], "/actuator/health")
+        self.assertFalse(report["used_fallback"])
+        self.assertEqual(report["review_summary"], "approved by model")
+        self.assertEqual(report["artifact_count"], 1)
+        self.assertEqual(report["artifacts"][0]["kind"], "json_document")
+        self.assertEqual(report["artifacts"][0]["bytes"], len(b'{"status":"UP"}'))
+        self.assertEqual(report["generation_trace"], ["normalized /actuator/health", "expert:elastic_api", "finalized"])
+        self.assertIn("timestamp", report)
+
+    def test_write_generation_report_records_diagnostics(self):
+        message = {
+            "primary_path": "/sse",
+            "used_fallback": False,
+            "review_summary": "deterministic validation passed",
+            "artifacts": [],
+            "generation_trace": ["normalized /sse", "expert:heuristic:generic_recon", "fallback"],
+            "generation_errors": ["expert fallback for /sse: HTTPStatusError 429 Too Many Requests"],
+            "generation_diagnostics": [
+                {
+                    "stage": "expert",
+                    "category": "heuristic_fallback",
+                    "target": "/sse",
+                    "message": "429 Too Many Requests",
+                    "details": {"exception_type": "HTTPStatusError"},
+                }
+            ],
+        }
+
+        self.handler._write_generation_report(message)
+
+        report_path = os.path.join(self.temp_dir, "generation_reports", "sse.json")
+        self.assertTrue(os.path.exists(report_path))
+        with open(report_path) as fh:
+            report = json.load(fh)
+        self.assertEqual(len(report["generation_diagnostics"]), 1)
+        diag = report["generation_diagnostics"][0]
+        self.assertEqual(diag["stage"], "expert")
+        self.assertEqual(diag["category"], "heuristic_fallback")
+        self.assertIn("429", diag["message"])
+        self.assertEqual(len(report["generation_errors"]), 1)
+
     def tearDown(self):
         self.loop.close()
         shutil.rmtree(self.temp_dir)

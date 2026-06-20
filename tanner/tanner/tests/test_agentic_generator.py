@@ -26,7 +26,9 @@ from tanner.generator.agentic.renderers import render_artifact
 from tanner.generator.agentic.validators import (
     ValidationError,
     ensure_generation_request,
+    diagnose_flow_reachability,
     validate_bundle,
+    validate_artifact_draft,
     validate_plan,
  )
 from tanner.generator.agentic.workflow import AgenticBundleGenerator
@@ -722,6 +724,38 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_bundle(bundle, request, runtime_config)
 
+    def test_validate_bundle_allows_artifact_count_overflow(self):
+        request = ensure_generation_request("example.com", "/admin", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=1)
+        bundle = GeneratedBundle(
+            primary_path="/admin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html; charset=utf-8"}],
+                    body_bytes=b"<html><body><p>Admin</p></body></html>",
+                    status_code=200,
+                    source_artifact_id="admin",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/robots.txt",
+                    kind="robots_txt",
+                    headers=[{"Content-Type": "text/plain; charset=utf-8"}],
+                    body_bytes=b"User-agent: *\nDisallow:\n",
+                    status_code=200,
+                    source_artifact_id="robots",
+                    artifact_scope="static_file",
+                ),
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        validate_bundle(bundle, request, runtime_config)
+
+
 
     def test_validate_bundle_allows_index_page_baseline_link(self):
         request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
@@ -780,6 +814,23 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         self.assertEqual(bundle.primary_path, "/admin/login")
         self.assertEqual(generator.review_calls, 2)
         self.assertIn("review loop budget exhausted", bundle.review_summary)
+
+
+    def test_review_loop_hard_failures_fall_back_after_max_review_loops(self):
+        generator = NoModelGenerator(
+            runtime_config=self._runtime_config(max_review_loops=1)
+        )
+        request = ensure_generation_request("example.com", "/admin/login", {"index_page": "/index.html"})
+
+        result = generator._review_revise_or_fallback(
+            {"request": request, "review_iteration": 0},
+            ["bundle exceeds max_bundle_artifacts"],
+            hard_failure=True,
+        )
+
+        decision = result["review_decision"]
+        self.assertEqual(decision.decision, "fallback")
+        self.assertIn("structural validation failed", decision.reasons[0])
 
     def test_review_log_appends_history_per_endpoint(self):
         runtime_config = self._runtime_config(max_review_loops=1)
@@ -841,6 +892,71 @@ class TestAgenticBundleGenerator(unittest.TestCase):
 
         validate_plan(plan, request, runtime_config)
 
+
+    def test_server_side_script_extension_does_not_force_html_content_type(self):
+        """
+        .php / .asp / .jsp extensions must not impose text/html on the plan.
+        Their actual content type is dynamic; only the artifact kind should
+        determine the expectation.  Regression for: validate_plan rejecting
+        /config/database.php with text/plain contract because .php was mapped
+        to text/html in the extension branch.
+        """
+        from tanner.generator.agentic.validators import _test_expected_content_type_for_kind_and_path_cases
+        _test_expected_content_type_for_kind_and_path_cases()
+
+        # Plan-level check: config_text at a .php path with text/plain contract must pass.
+        request = ensure_generation_request("example.com", "/config/database.php", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=3)
+        plan = ResourcePlan(
+            primary_path="/config/database.php",
+            theme_summary="Exposed PHP database config",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="db-config",
+                    path="/config/database.php",
+                    kind="config_text",
+                    purpose="PHP database configuration file",
+                    response_contract={"status_code": 200, "content_type": "text/plain; charset=utf-8"},
+                ),
+                PlannedArtifact(
+                    artifact_id="db-log",
+                    path="/config/db.log",
+                    kind="log_excerpt",
+                    purpose="Supporting database log",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["config_theft"],
+        )
+        validate_plan(plan, request, runtime_config)
+
+        # html_page at a .php path with text/html contract must also pass.
+        plan2 = ResourcePlan(
+            primary_path="/config/database.php",
+            theme_summary="PHP login page",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="login",
+                    path="/config/database.php",
+                    kind="html_page",
+                    purpose="PHP login page",
+                    response_contract={"status_code": 200, "content_type": "text/html; charset=utf-8"},
+                ),
+                PlannedArtifact(
+                    artifact_id="style",
+                    path="/assets/style.css",
+                    kind="stylesheet",
+                    purpose="stylesheet",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["auth_portal"],
+        )
+        validate_plan(plan2, request, runtime_config)
     def test_vendor_json_content_type_matches_json_contracts(self):
         request = ensure_generation_request("example.com", "/actuator/gateway/routes", {"index_page": "/index.html"})
         runtime_config = self._runtime_config(max_bundle_artifacts=2)
@@ -890,19 +1006,126 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         validate_plan(plan, request, runtime_config)
         validate_bundle(bundle, request, runtime_config)
 
-    def test_design_validation_loop_budget_is_independent_from_review_loop_budget(self):
+    def test_xml_structured_content_types_match_xml_contracts(self):
+        request = ensure_generation_request("example.com", "/wsman", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=2)
+        plan = ResourcePlan(
+            primary_path="/wsman",
+            theme_summary="WS-Man endpoint",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="wsdl",
+                    path="/wsman/service.wsdl",
+                    kind="xml_document",
+                    purpose="WSDL service description",
+                    response_contract={
+                        "status_code": 200,
+                        "content_type": "application/wsdl+xml; charset=utf-8",
+                    },
+                ),
+                PlannedArtifact(
+                    artifact_id="primary",
+                    path="/wsman",
+                    kind="xml_document",
+                    purpose="Primary WS-Man SOAP endpoint",
+                    response_contract={
+                        "status_code": 200,
+                        "content_type": "application/soap+xml; charset=utf-8",
+                    },
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["device_protocol"],
+        )
+        bundle = GeneratedBundle(
+            primary_path="/wsman",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/wsman",
+                    kind="xml_document",
+                    headers=[{"Content-Type": "application/soap+xml; charset=utf-8"}],
+                    body_bytes=b"<?xml version=\"1.0\"?><s:Envelope></s:Envelope>",
+                    status_code=200,
+                    source_artifact_id="primary",
+                    artifact_scope="static_file",
+                )
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+
+        validate_plan(plan, request, runtime_config)
+        validate_bundle(bundle, request, runtime_config)
+
+    def test_text_family_content_types_match_text_contracts(self):
+        request = ensure_generation_request("example.com", "/boaform/admin/formLogin", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(max_bundle_artifacts=2)
+        plan = ResourcePlan(
+            primary_path="/boaform/admin/formLogin",
+            theme_summary="Boa login handler",
+            artifacts=[
+                PlannedArtifact(
+                    artifact_id="handler",
+                    path="/boaform/admin/formLogin",
+                    kind="plain_text",
+                    purpose="Login handler response",
+                    response_contract={
+                        "status_code": 200,
+                        "content_type": "text/html; charset=UTF-8",
+                    },
+                ),
+                PlannedArtifact(
+                    artifact_id="robots",
+                    path="/robots.txt",
+                    kind="robots_txt",
+                    purpose="Robots policy",
+                ),
+            ],
+            bundle_budget_count=2,
+            bundle_budget_bytes=16_384,
+            static_only=True,
+            review_focus=["router_login"],
+        )
+
+        validate_plan(plan, request, runtime_config)
+
+    def test_text_extension_allows_semantic_text_kinds(self):
+        request = ensure_generation_request("example.com", "/.env", {"index_page": "/index.html"})
+        draft = ArtifactDraft(
+            artifact_id="backup-manifest",
+            path="/backups/manifest.txt",
+            kind="backup_manifest",
+            content_model={"lines": ["2026-05-25T00:00:00Z app.tar.gz"]},
+            content_type="text/plain; charset=utf-8",
+        )
+
+        validate_artifact_draft(draft, request)
+
+    def test_design_validation_loop_budget_exhaustion_falls_through_with_heuristic_plan(self):
+        request = ensure_generation_request("example.com", "/wp-login.php", {"index_page": "/index.html"})
         generator = NoModelGenerator(
             runtime_config=self._runtime_config(max_review_loops=1, max_design_validation_loops=2)
         )
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
 
-        first = generator._design_revise_or_fallback({}, ["invalid dynamic scope"])
-        second = generator._design_revise_or_fallback(
-            {"design_validation_iteration": first["design_validation_iteration"]},
-            ["still invalid"],
-        )
-
+        state_0 = {"request": request, "expert_spec": expert_spec}
+        first = generator._design_revise_or_fallback(state_0, ["invalid dynamic scope"])
         self.assertEqual(first["design_validation_decision"], "revise")
-        self.assertEqual(second["design_validation_decision"], "fallback")
+
+        state_1 = {
+            "request": request,
+            "expert_spec": expert_spec,
+            "design_validation_iteration": first["design_validation_iteration"],
+        }
+        second = generator._design_revise_or_fallback(state_1, ["still invalid"])
+        # Budget exhausted: must route to approve (proceed with heuristic plan)
+        # rather than triggering a deterministic stub fallback.
+        self.assertEqual(second["design_validation_decision"], "approve")
+        self.assertIn("resource_plan", second)
+        self.assertIsNotNone(second["resource_plan"])
+        self.assertIn("heuristic_fallthrough", " ".join(second.get("trace_notes", [])))
 
     def test_runtime_config_disallows_fallback_persistence_by_default(self):
         runtime_config = self._runtime_config()
@@ -1104,6 +1327,224 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         )
 
         validate_bundle(bundle, request, runtime_config)
+
+    def test_flow_reachability_diagnostics_are_nonblocking(self):
+        request = ensure_generation_request("example.com", "/admin", {"index_page": "/index.html"})
+        runtime_config = self._runtime_config(enable_scripted_flows=True, max_bundle_artifacts=3)
+        bundle = GeneratedBundle(
+            primary_path="/admin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Admin</body></html>",
+                    status_code=200,
+                    source_artifact_id="admin",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/login",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Login</body></html>",
+                    status_code=200,
+                    source_artifact_id="login",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/admin/unused",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Unused</body></html>",
+                    status_code=200,
+                    source_artifact_id="unused",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="approved",
+            used_fallback=False,
+            flow_descriptor=FlowDescriptor(
+                rules=[
+                    FlowRule(
+                        match_path="/admin",
+                        condition=FlowCondition(missing_cookie="session_token"),
+                        response=FlowResponse(redirect_to="/login", status_code=302),
+                        priority=10,
+                    )
+                ]
+            ),
+        )
+
+        validate_bundle(bundle, request, runtime_config)
+        diagnostics = diagnose_flow_reachability(bundle)
+
+        self.assertIn("flow artifact /_flow/admin/unused is not served by any flow rule", diagnostics)
+
+    def test_finalize_bundle_persists_flow_reachability_diagnostics(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(enable_scripted_flows=True, max_bundle_artifacts=3))
+        request = ensure_generation_request("example.com", "/admin", {"index_page": "/index.html"})
+        bundle = GeneratedBundle(
+            primary_path="/admin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Admin</body></html>",
+                    status_code=200,
+                    source_artifact_id="admin",
+                    artifact_scope="dynamic_endpoint",
+                ),
+                GeneratedArtifact(
+                    path="/login",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Login</body></html>",
+                    status_code=200,
+                    source_artifact_id="login",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/_flow/admin/unused",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b"<html><body>Unused</body></html>",
+                    status_code=200,
+                    source_artifact_id="unused",
+                    artifact_scope="dynamic_endpoint",
+                ),
+            ],
+            review_summary="approved",
+            used_fallback=False,
+            flow_descriptor=FlowDescriptor(
+                rules=[
+                    FlowRule(
+                        match_path="/admin",
+                        condition=FlowCondition(missing_cookie="session_token"),
+                        response=FlowResponse(redirect_to="/login", status_code=302),
+                        priority=10,
+                    )
+                ]
+            ),
+        )
+
+        result = self.loop.run_until_complete(
+            generator._finalize_bundle({"request": request, "generated_bundle": bundle})
+        )
+        finalized = result["generated_bundle"]
+
+        self.assertFalse(finalized.used_fallback)
+        self.assertIn("FLOW_REACHABILITY_WARNING", finalized.review_summary)
+        self.assertIn("/_flow/admin/unused", finalized.review_summary)
+
+
+    def test_finalize_bundle_keeps_artifact_count_overflow_when_bytes_fit(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(max_bundle_artifacts=2))
+        request = ensure_generation_request("example.com", "/admin", {"index_page": "/index.html"})
+        bundle = GeneratedBundle(
+            primary_path="/admin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><head><link rel="stylesheet" href="/app.css"></head><body>Admin</body></html>',
+                    status_code=200,
+                    source_artifact_id="admin",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/app.css",
+                    kind="stylesheet",
+                    headers=[{"Content-Type": "text/css"}],
+                    body_bytes=b"body { color: #111; }",
+                    status_code=200,
+                    source_artifact_id="app-css",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/robots.txt",
+                    kind="robots_txt",
+                    headers=[{"Content-Type": "text/plain"}],
+                    body_bytes=b"User-agent: *\nDisallow:\n",
+                    status_code=200,
+                    source_artifact_id="robots",
+                    artifact_scope="static_file",
+                ),
+            ],
+            review_summary="approved",
+            used_fallback=False,
+        )
+
+        result = self.loop.run_until_complete(
+            generator._finalize_bundle({"request": request, "generated_bundle": bundle})
+        )
+        finalized = result["generated_bundle"]
+
+        self.assertEqual(
+            [artifact.path for artifact in finalized.artifacts],
+            ["/admin", "/app.css", "/robots.txt"],
+        )
+        self.assertFalse(
+            any(
+                diagnostic["category"] == "trimmed_to_byte_limit"
+                for diagnostic in finalized.generation_diagnostics
+            )
+        )
+        validate_bundle(finalized, request, generator.runtime_config)
+
+    def test_finalize_bundle_trims_optional_artifacts_to_byte_limit(self):
+        generator = NoModelGenerator(runtime_config=self._runtime_config(max_bundle_bytes=1024))
+        request = ensure_generation_request("example.com", "/admin", {"index_page": "/index.html"})
+        bundle = GeneratedBundle(
+            primary_path="/admin",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/admin",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html"}],
+                    body_bytes=b'<html><head><link rel="stylesheet" href="/app.css"></head><body>A</body></html>',
+                    status_code=200,
+                    source_artifact_id="admin",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/app.css",
+                    kind="stylesheet",
+                    headers=[{"Content-Type": "text/css"}],
+                    body_bytes=b"body{color:#111}",
+                    status_code=200,
+                    source_artifact_id="app-css",
+                    artifact_scope="static_file",
+                ),
+                GeneratedArtifact(
+                    path="/robots.txt",
+                    kind="robots_txt",
+                    headers=[{"Content-Type": "text/plain"}],
+                    body_bytes=(b"User-agent: *\nDisallow: /private\nSitemap: /sitemap.xml\n" * 32),
+                    status_code=200,
+                    source_artifact_id="robots",
+                    artifact_scope="static_file",
+                ),
+            ],
+            review_summary="approved",
+            used_fallback=False,
+        )
+
+        result = self.loop.run_until_complete(
+            generator._finalize_bundle({"request": request, "generated_bundle": bundle})
+        )
+        finalized = result["generated_bundle"]
+
+        self.assertEqual([artifact.path for artifact in finalized.artifacts], ["/admin", "/app.css"])
+        self.assertTrue(
+            any(
+                diagnostic["category"] == "trimmed_to_byte_limit"
+                for diagnostic in finalized.generation_diagnostics
+            )
+        )
+        validate_bundle(finalized, request, generator.runtime_config)
 
 
     def test_flow_designer_does_not_add_missing_cookie_guard_to_login_page(self):
@@ -1475,219 +1916,3 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         self.assertEqual(third.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
         self.assertEqual(locked.artifact_path, "/_flow/boaform-admin-formLogin/post-locked")
         self.assertEqual(reset.artifact_path, "/_flow/boaform-admin-formLogin/post-fail")
-
-    # ── coherence binding table (V2-gated) ────────────────────────────────────
-
-    def test_normalize_coherence_bindings_flattens_all_value_types(self):
-        result = AgenticBundleGenerator._normalize_coherence_bindings({
-            "pod_name": "api-gateway-7c9d8f6b6b-k2r4m",
-            "replicas": 3,
-            "healthy": True,
-            "image": {"name": "registry.internal/api:v1.2.3", "tag": "v1.2.3"},
-            "ports": [8080, 443],
-            "unset": None,
-        })
-        self.assertEqual(result["pod_name"], "api-gateway-7c9d8f6b6b-k2r4m")
-        self.assertEqual(result["replicas"], "3")
-        self.assertEqual(result["healthy"], "True")
-        # nested dict serialised to compact JSON
-        self.assertIn("registry.internal/api:v1.2.3", result["image"])
-        # nested list serialised to compact JSON
-        self.assertIn("8080", result["ports"])
-        # None values omitted
-        self.assertNotIn("unset", result)
-
-    def test_fan_out_coders_threads_coherence_bindings_into_each_send(self):
-        generator = NoModelGenerator(runtime_config=self._runtime_config())
-        request = ensure_generation_request("example.com", "/api/v1/pods", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        resource_plan = generator._heuristic_plan(request, expert_spec)
-        bindings = {"pod_name": "web-abc123", "image": "registry.internal/web:v1.0"}
-        sends = generator._fan_out_coders({
-            "request": request,
-            "expert_spec": expert_spec,
-            "resource_plan": resource_plan,
-            "plan_revision": 1,
-            "coherence_bindings": bindings,
-        })
-        self.assertEqual(len(sends), len(resource_plan.artifacts))
-        for send in sends:
-            self.assertEqual(send.node, "coder_node")
-            self.assertIn("coherence_bindings", send.arg)
-            self.assertEqual(send.arg["coherence_bindings"], bindings)
-
-    def test_fan_out_coders_passes_none_bindings_when_not_in_state(self):
-        """Fan-out with no coherence_bindings key in state passes None, not KeyError."""
-        generator = NoModelGenerator(runtime_config=self._runtime_config())
-        request = ensure_generation_request("example.com", "/containers/json", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        resource_plan = generator._heuristic_plan(request, expert_spec)
-        sends = generator._fan_out_coders({
-            "request": request,
-            "expert_spec": expert_spec,
-            "resource_plan": resource_plan,
-            "plan_revision": 1,
-            # coherence_bindings intentionally absent
-        })
-        for send in sends:
-            self.assertIn("coherence_bindings", send.arg)
-            self.assertIsNone(send.arg["coherence_bindings"])
-
-    def test_coder_prompt_uses_binding_table_when_v2_and_bindings_set(self):
-        """V2: coder prompt must contain the hard BINDING TABLE block, not advisory label."""
-        captured = []
-
-        class CapturingGenerator(NoModelGenerator):
-            async def _invoke_structured(self, role_name, schema, messages):
-                if role_name == "coder":
-                    captured.append(messages)
-                raise RuntimeError("no model — fall through to heuristic")
-
-        cfg = self._runtime_config(enable_scripted_flows=True)
-        generator = CapturingGenerator(runtime_config=cfg)
-        request = ensure_generation_request("example.com", "/api/v1/pods", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        resource_plan = generator._heuristic_plan(request, expert_spec)
-        artifact = resource_plan.artifacts[0]
-        bindings = {"cluster_name": "prod-gke-a", "pod_uid": "abc-123", "image": "registry.internal/api:v2.1"}
-
-        self.loop.run_until_complete(generator._coder_node({
-            "request": request,
-            "expert_spec": expert_spec,
-            "resource_plan": resource_plan,
-            "pending_artifact": artifact,
-            "plan_revision": 1,
-            "coherence_bindings": bindings,
-        }))
-
-        self.assertTrue(captured, "expected coder to be invoked at least once")
-        user_content = captured[0][1]["content"]
-        self.assertIn("BINDING TABLE", user_content)
-        self.assertIn("cluster_name: prod-gke-a", user_content)
-        self.assertIn("image: registry.internal/api:v2.1", user_content)
-        self.assertIn("MUST reproduce these exact values", user_content)
-        # advisory label must NOT appear when V2 binding table is active
-        self.assertNotIn("Coherence facts to reuse", user_content)
-
-    def test_coder_prompt_uses_advisory_json_when_v1(self):
-        """V1 (enable_scripted_flows=False): coder prompt must use the original advisory JSON."""
-        captured = []
-
-        class CapturingGenerator(NoModelGenerator):
-            async def _invoke_structured(self, role_name, schema, messages):
-                if role_name == "coder":
-                    captured.append(messages)
-                raise RuntimeError("no model — fall through to heuristic")
-
-        cfg = self._runtime_config(enable_scripted_flows=False)
-        generator = CapturingGenerator(runtime_config=cfg)
-        request = ensure_generation_request("example.com", "/api/v1/pods", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        resource_plan = generator._heuristic_plan(request, expert_spec)
-        resource_plan = resource_plan.model_copy(update={
-            "coherence_facts": {"cluster_name": "prod-gke-a"}
-        })
-        artifact = resource_plan.artifacts[0]
-
-        self.loop.run_until_complete(generator._coder_node({
-            "request": request,
-            "expert_spec": expert_spec,
-            "resource_plan": resource_plan,
-            "pending_artifact": artifact,
-            "plan_revision": 1,
-            # No coherence_bindings — V1 reads coherence_facts from resource_plan directly
-        }))
-
-        self.assertTrue(captured)
-        user_content = captured[0][1]["content"]
-        # V1: advisory JSON value must appear; binding table must NOT
-        self.assertIn("prod-gke-a", user_content)
-        self.assertNotIn("BINDING TABLE", user_content)
-
-    def test_design_node_v2_populates_coherence_bindings_in_return(self):
-        """Design node must return coherence_bindings dict when V2 and coherence_facts non-empty."""
-        from tanner.generator.agentic.models import (
-            ResourcePlan as _RP, PlannedArtifact as _PA, ResponseContract as _RC,
-        )
-
-        class FakeDesignGenerator(NoModelGenerator):
-            async def _invoke_structured(self, role_name, schema, messages):
-                if role_name == "design":
-                    return _RP(
-                        primary_path="/api/v1/pods",
-                        theme_summary="Kubernetes API",
-                        artifacts=[_PA(
-                            artifact_id="pod-list",
-                            path="/api/v1/pods",
-                            kind="json_document",
-                            purpose="pod list",
-                            response_contract=_RC(content_type="application/json"),
-                        )],
-                        bundle_budget_count=1,
-                        bundle_budget_bytes=262144,
-                        coherence_facts={
-                            "cluster_name": "prod-gke-a",
-                            "pod_uid": "abc-def-123",
-                        },
-                    )
-                raise RuntimeError("no model")
-
-        cfg = self._runtime_config(enable_scripted_flows=True)
-        generator = FakeDesignGenerator(runtime_config=cfg)
-        request = ensure_generation_request("example.com", "/api/v1/pods", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        expert_spec = expert_spec.model_copy(update={"confidence": 0.9})
-
-        result = self.loop.run_until_complete(generator._design_node({
-            "request": request,
-            "expert_spec": expert_spec,
-            "review_feedback": [],
-            "plan_revision": 0,
-        }))
-
-        self.assertIn("coherence_bindings", result)
-        bindings = result["coherence_bindings"]
-        self.assertIsNotNone(bindings)
-        self.assertEqual(bindings["cluster_name"], "prod-gke-a")
-        self.assertEqual(bindings["pod_uid"], "abc-def-123")
-
-    def test_design_node_v1_does_not_produce_coherence_bindings(self):
-        """V1 design node must return coherence_bindings=None regardless of coherence_facts."""
-        from tanner.generator.agentic.models import (
-            ResourcePlan as _RP, PlannedArtifact as _PA, ResponseContract as _RC,
-        )
-
-        class FakeDesignGenerator(NoModelGenerator):
-            async def _invoke_structured(self, role_name, schema, messages):
-                if role_name == "design":
-                    return _RP(
-                        primary_path="/api/v1/pods",
-                        theme_summary="Kubernetes API",
-                        artifacts=[_PA(
-                            artifact_id="pod-list",
-                            path="/api/v1/pods",
-                            kind="json_document",
-                            purpose="pod list",
-                            response_contract=_RC(content_type="application/json"),
-                        )],
-                        bundle_budget_count=1,
-                        bundle_budget_bytes=262144,
-                        coherence_facts={"cluster_name": "prod-gke-a"},
-                    )
-                raise RuntimeError("no model")
-
-        cfg = self._runtime_config(enable_scripted_flows=False)
-        generator = FakeDesignGenerator(runtime_config=cfg)
-        request = ensure_generation_request("example.com", "/api/v1/pods", {})
-        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
-        expert_spec = expert_spec.model_copy(update={"confidence": 0.9})
-
-        result = self.loop.run_until_complete(generator._design_node({
-            "request": request,
-            "expert_spec": expert_spec,
-            "review_feedback": [],
-            "plan_revision": 0,
-        }))
-
-        self.assertIn("coherence_bindings", result)
-        self.assertIsNone(result["coherence_bindings"])

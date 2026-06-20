@@ -17,6 +17,7 @@ from tanner.config import TannerConfig
 from tanner.emulators import base
 from tanner.generator import base_generator
 from tanner.generator.agentic import AgenticBundleGenerator, GeneratedBundle
+from tanner.generator.agentic.models import FlowDescriptor
 from tanner.reporting.log_local import Reporting as local_report
 from tanner.reporting.log_mongodb import Reporting as mongo_report
 from tanner.reporting.log_hpfeeds import Reporting as hpfeeds_report
@@ -27,10 +28,6 @@ from tanner.flow import FlowEvaluator
 class MetaGenerationPolicy:
     _HIGH_VALUE_PATH_RE = re.compile(
         r"(^/(api(?:/|$)|login|admin|wsman|_all_dbs|containers/json|solr(?:/|$)|v1/|_nodes|_stats|_cat/indices|json/version|_config|hnap1|tr064dev\.xml|nacos/|hazelcast/|clientwebservice/|manager/html|jmx|invoker/readonly|health|actuator/health))",
-        re.IGNORECASE,
-    )
-    _SCANNER_UA_RE = re.compile(
-        r"censys|zgrab|shodan|go-http-client|python-requests|curl/|python-httpx|masscan|nmap|libredtail",
         re.IGNORECASE,
     )
     _STATIC_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|svg|ico|css|js|map|woff2?|ttf|eot)(?:$|\?)", re.IGNORECASE)
@@ -49,7 +46,6 @@ class MetaGenerationPolicy:
         self.hourly_budget = int(self._config_value("meta_policy_hourly_budget", 10))
         self.daily_budget = int(self._config_value("meta_policy_daily_budget", 120))
         self.max_path_length = int(self._config_value("meta_policy_max_path_length", 120))
-        self.require_non_ua_positive = self._as_bool(self._config_value("meta_policy_require_non_ua_positive", True))
         pending_ttl_default = min(self.per_ip_cooldown_seconds, 600) if self.per_ip_cooldown_seconds > 0 else 600
         self.pending_ttl_seconds = int(self._config_value("meta_policy_pending_ttl_seconds", pending_ttl_default))
 
@@ -136,7 +132,6 @@ class MetaGenerationPolicy:
         is_high_value = bool(self._HIGH_VALUE_PATH_RE.search(path))
         has_distinct_ips = distinct_ips >= self.min_distinct_ips
         has_recent_hits = recent_count >= self.min_recent_hits
-        scanner_ua = bool(self._SCANNER_UA_RE.search(user_agent))
 
         is_random = self._looks_random_path(path)
         exploit_like = bool(self._EXPLOIT_PATH_RE.search(path))
@@ -144,13 +139,10 @@ class MetaGenerationPolicy:
         if is_random or exploit_like:
             return False, "negative_signal"
 
-        positive_any = is_high_value or has_distinct_ips or has_recent_hits or scanner_ua
-        non_ua_positive = is_high_value or has_distinct_ips or has_recent_hits
+        positive_signals = is_high_value or has_distinct_ips or has_recent_hits
 
-        if not positive_any:
+        if not positive_signals:
             return False, "no_positive_signal"
-        if self.require_non_ua_positive and not non_ua_positive:
-            return False, "ua_only_positive"
 
         if src_ip and self.per_ip_cooldown_seconds > 0:
             last_generated = self._last_generation_by_ip.get(src_ip)
@@ -188,6 +180,7 @@ class TannerServer:
         self.flows_enabled = self._is_flows_enabled()
         self.flow_evaluator = FlowEvaluator() if self.flows_enabled else None
         self.meta_generation_policy = MetaGenerationPolicy(self.logger)
+        self._registered_flow_descriptor_fingerprints = {}
 
         if TannerConfig.get("HPFEEDS", "enabled") is True:
             self.hpf = hpfeeds_report()
@@ -238,20 +231,15 @@ class TannerServer:
 
     @staticmethod
     def _extract_host(data):
-        # Prefer Snare's configured page_dir: the domain the honeypot impersonates.
-        # This is the value that gives the LLM meaningful organisational context.
-        page_dir = data.get("page_dir")
-        if isinstance(page_dir, str) and page_dir.strip():
-            return page_dir.strip()
-        # Fall back to Host header, but discard raw IP addresses — they carry
-        # no domain context and degrade generation quality.
         headers = data.get("headers") if isinstance(data, dict) else {}
         if isinstance(headers, dict):
             host = headers.get("Host")
             if isinstance(host, str) and host.strip():
-                host = host.split(":")[0].strip()
-                if host and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                    return host
+                return host.split(":")[0]
+
+        peer = data.get("peer") if isinstance(data, dict) else {}
+        if isinstance(peer, dict):
+            return peer.get("ip")
         return None
 
     @staticmethod
@@ -301,6 +289,33 @@ class TannerServer:
         if flow_result.headers:
             payload["headers"] = flow_result.headers
         return {"type": 4, "payload": payload}
+
+    def _register_event_flow_descriptors(self, data):
+        """Register persisted Snare flow descriptors carried with an event payload."""
+        if not self.flows_enabled or self.flow_evaluator is None:
+            return
+
+        raw_descriptors = data.get("flow_descriptors") if isinstance(data, dict) else None
+        if not isinstance(raw_descriptors, dict):
+            return
+
+        for key, raw_descriptor in raw_descriptors.items():
+            if not isinstance(key, str) or not isinstance(raw_descriptor, dict):
+                self.logger.warning("Ignoring malformed event flow descriptor entry for key %r", key)
+                continue
+
+            try:
+                fingerprint = json.dumps(raw_descriptor, sort_keys=True, separators=(",", ":"))
+                descriptor = FlowDescriptor.model_validate(raw_descriptor)
+            except Exception as error:
+                self.logger.warning("Ignoring invalid event flow descriptor for key %r: %s", key, error)
+                continue
+
+            if self._registered_flow_descriptor_fingerprints.get(key) == fingerprint:
+                continue
+
+            self.flow_evaluator.register(key, descriptor)
+            self._registered_flow_descriptor_fingerprints[key] = fingerprint
 
     async def _save_meta_job(self, job_id, fields):
         if self.redis_client is None:
@@ -353,6 +368,9 @@ class TannerServer:
                     "review_summary": bundle.review_summary,
                     "used_fallback": bundle.used_fallback,
                     "flow_descriptor": flow_descriptor,
+                    "generation_trace": getattr(bundle, "generation_trace", []),
+                    "generation_errors": getattr(bundle, "generation_errors", []),
+                    "generation_diagnostics": getattr(bundle, "generation_diagnostics", []),
                 },
             )
         except Exception as error:
@@ -377,6 +395,8 @@ class TannerServer:
         else:
             session, _ = await self.session_manager.add_or_update_session(data, self.redis_client)
             self.logger.info("Requested path %s", path)
+
+            self._register_event_flow_descriptors(data)
 
             # V2: evaluate flow rules before normal detection
             if self.flows_enabled and self.flow_evaluator is not None:
@@ -525,6 +545,9 @@ class TannerServer:
 
         artifacts = self._deserialize_json_field(job_data.get("artifacts"), [])
         flow_descriptor = self._deserialize_json_field(job_data.get("flow_descriptor"), None)
+        generation_trace = self._deserialize_json_field(job_data.get("generation_trace"), [])
+        generation_errors = self._deserialize_json_field(job_data.get("generation_errors"), [])
+        generation_diagnostics = self._deserialize_json_field(job_data.get("generation_diagnostics"), [])
         response_msg = self._make_response(
             msg={
                 "state": "ready",
@@ -534,6 +557,9 @@ class TannerServer:
                 "review_summary": job_data.get("review_summary", ""),
                 "used_fallback": str(job_data.get("used_fallback", "")).lower() == "true",
                 "flow_descriptor": flow_descriptor,
+                "generation_trace": generation_trace,
+                "generation_errors": generation_errors,
+                "generation_diagnostics": generation_diagnostics,
             }
         )
         return web.json_response(response_msg)

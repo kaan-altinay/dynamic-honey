@@ -171,7 +171,7 @@ def _render_config_text(draft: ArtifactDraft) -> bytes:
 
 def _render_json_document(draft: ArtifactDraft) -> bytes:
     document = draft.content_model.get("document")
-    if not isinstance(document, dict):
+    if not isinstance(document, (dict, list)):
         document = {}
     return (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 

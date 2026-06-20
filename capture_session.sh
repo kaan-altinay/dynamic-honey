@@ -27,7 +27,7 @@ Options:
                           Example: 16-19
   --range-start <start>   Equivalent shorthand for a 4-IP block. Example: --range-start 16 means 16-19.
   --captures-dir <path>   Artifact root (default: ./captures_new)
-  --iface <name>          Capture interface (default: eth0)
+  --iface <name>          Capture interface (default: enp6s20)
   --page-url <host>       Snare page-dir / PAGE_URL (default: example.com)
   --forward-ports <list>  Comma-separated host ports forwarded to Snare :80
                           (default: 80,443,8080,8081,8000,8888,8443,9200,8983,5984,2375,6443,5000,8500,5701,8848,5985,5986,17778)
@@ -55,7 +55,7 @@ CAPTURES_DIR="${ROOT_DIR}/captures_new"
 SNARE_TEMPLATE_DIR="/home/kaan/snare-data/snare"
 PUBLIC_IP_PREFIX="145.220.178"
 DEFAULT_PAGE_URL="example.com"
-DEFAULT_IFACE="eth0"
+DEFAULT_IFACE="enp6s20"
 DEFAULT_FORWARD_PORTS="80,443,8080,8081,8000,8888,8443,9200,8983,5984,2375,6443,5000,8500,5701,8848,5985,5986,17778"
 DEFAULT_CLIPROXY_DIR="/home/kaan/cliproxyapi"
 DEFAULT_CLIPROXY_CMD="./cli-proxy-api"
