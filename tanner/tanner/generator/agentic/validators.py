@@ -1080,9 +1080,15 @@ def diagnose_flow_reachability(bundle: GeneratedBundle) -> list[str]:
         for rule in descriptor.rules
         if rule.response.artifact_path is not None
     }
+    sourcing_artifact_paths = {
+        rule.source_artifact_path
+        for rule in descriptor.rules
+        if rule.source_artifact_path is not None
+    }
+    tied_in_artifact_paths = referenced_artifact_paths | sourcing_artifact_paths
 
     diagnostics: list[str] = []
-    for path in sorted(flow_artifact_paths - referenced_artifact_paths):
+    for path in sorted(flow_artifact_paths - tied_in_artifact_paths):
         diagnostics.append(
             "flow artifact {} is not served by any flow rule".format(path)
         )

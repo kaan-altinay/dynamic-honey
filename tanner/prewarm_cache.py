@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+Pre-generate and verify Snare/Tanner cache entries offline, for either the
+V1 or V2 agentic generator -- selected entirely by which --generator-config
+YAML is passed in:
+
+  V1:  tanner/data/config.v1-smoketest.yaml  (GENERATOR.enable_scripted_flows: false)
+  V2:  tanner/data/config.v2-smoketest.yaml  (GENERATOR.enable_scripted_flows: true,
+       GENERATOR.v2_overrides applies the parameter-sweep-tuned values)
+
+Both modes share identical endpoint loading, meta.json bookkeeping, hash
+dedup/collision handling, and verification. V2 additionally persists each
+endpoint's FlowDescriptor into a single, merged pages/<page-url>/flows.json
+(keyed by primary_path) -- V1 bundles never carry a flow_descriptor, so V1
+runs never touch that file.
+"""
 import argparse
 import asyncio
 import hashlib
@@ -8,18 +23,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-import yaml
-
-from tanner.generator.agentic.models import GeneratorRoleConfig, GeneratorRuntimeConfig
+from tanner.config import TannerConfig
+from tanner.generator.agentic.config import load_runtime_config
 from tanner.generator.agentic.workflow import AgenticBundleGenerator
-
-ROLE_NAMES = ("expert", "design", "coder", "review")
 
 
 @dataclass
 class VerificationResult:
     missing_meta: list[str]
     missing_hash_files: list[str]
+    missing_flow_entries: list[str]
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -69,39 +82,16 @@ def load_endpoints(path: Path, index_page: str) -> list[str]:
     return ordered
 
 
-def load_runtime_config(config_path: Path) -> GeneratorRuntimeConfig:
-    config_data = yaml.safe_load(config_path.read_text()) or {}
-    generator = _as_dict(config_data.get("GENERATOR"))
-    role_defaults = _as_dict(generator.get("role_defaults"))
-    configured_roles = _as_dict(generator.get("roles"))
-
-    roles: dict[str, GeneratorRoleConfig] = {}
-    for role_name in ROLE_NAMES:
-        merged = dict(role_defaults)
-        merged.update(_as_dict(configured_roles.get(role_name)))
-        roles[role_name] = GeneratorRoleConfig.model_validate(merged)
-
-    return GeneratorRuntimeConfig(
-        backend=str(generator.get("backend", "agentic")),
-        max_review_loops=int(generator.get("max_review_loops", 2)),
-        max_bundle_artifacts=int(generator.get("max_bundle_artifacts", 4)),
-        max_bundle_bytes=int(generator.get("max_bundle_bytes", 262_144)),
-        checkpoint_path=str(generator.get("checkpoint_path", "/tmp/tanner-agentic-checkpoints.sqlite")),
-        graph_recursion_limit=int(generator.get("graph_recursion_limit", 200)),
-        review_log_path=str(generator.get("review_log_path", "/tmp/tanner-agentic-review-log.json")),
-        enable_live_research=bool(generator.get("enable_live_research", True)),
-        max_tool_response_chars=int(generator.get("max_tool_response_chars", 4_000)),
-        max_command_output_chars=int(generator.get("max_command_output_chars", 4_000)),
-        command_timeout=int(generator.get("command_timeout", 5)),
-        max_concurrent_model_calls=int(generator.get("max_concurrent_model_calls", 4)),
-        inter_call_delay_seconds=float(generator.get("inter_call_delay_seconds", 0.0)),
-        max_rate_limit_retries=int(generator.get("max_rate_limit_retries", 2)),
-        default_rate_limit_backoff_seconds=float(generator.get("default_rate_limit_backoff_seconds", 12.0)),
-        max_length_limit_retries=int(generator.get("max_length_limit_retries", 2)),
-        length_retry_token_increase=int(generator.get("length_retry_token_increase", 800)),
-        max_length_retry_tokens=int(generator.get("max_length_retry_tokens", 6_000)),
-        roles=roles,
-    )
+def set_generator_config(config_path: Path):
+    # Delegates to the shared loader (tanner.generator.agentic.config) so
+    # GENERATOR.enable_scripted_flows / v2_overrides are honored exactly as
+    # they are for the live server and smoketest_v2.py -- single source of
+    # truth. V1 vs V2 is selected purely by which YAML is passed in:
+    # config.v1-smoketest.yaml (enable_scripted_flows=false) or
+    # config.v2-smoketest.yaml (enable_scripted_flows=true, v2_overrides
+    # applied).
+    TannerConfig.set_config(str(config_path))
+    return load_runtime_config()
 
 
 def load_meta(meta_path: Path) -> dict[str, Any]:
@@ -130,7 +120,26 @@ def write_seedfile(seedfile_path: Path, endpoints: list[str]) -> None:
     seedfile_path.write_text("\n".join(endpoints) + "\n")
 
 
-def verify_cache(meta: dict[str, Any], page_dir: Path, endpoints: list[str]) -> VerificationResult:
+def load_flows(flows_path: Path) -> dict[str, Any]:
+    if not flows_path.exists():
+        return {}
+    flows = json.loads(flows_path.read_text())
+    if not isinstance(flows, dict):
+        raise ValueError(f"flows.json must contain an object at {flows_path}")
+    return flows
+
+
+def write_flows(flows_path: Path, flows: dict[str, Any]) -> None:
+    flows_path.write_text(json.dumps(flows, indent=2, sort_keys=True) + "\n")
+
+
+def verify_cache(
+    meta: dict[str, Any],
+    page_dir: Path,
+    endpoints: list[str],
+    flows: dict[str, Any],
+    expected_flow_paths: set[str],
+) -> VerificationResult:
     missing_meta = [endpoint for endpoint in endpoints if endpoint not in meta]
 
     missing_hash_files: list[str] = []
@@ -145,7 +154,16 @@ def verify_cache(meta: dict[str, Any], page_dir: Path, endpoints: list[str]) -> 
         if not (page_dir / hash_name).is_file():
             missing_hash_files.append(f"{endpoint} -> {hash_name}")
 
-    return VerificationResult(missing_meta=missing_meta, missing_hash_files=missing_hash_files)
+    # Flow rules generated this run (V2) that didn't make it into the
+    # on-disk flows.json -- e.g. a crash between write_meta() and
+    # write_flows() for a given endpoint.
+    missing_flow_entries = sorted(expected_flow_paths - flows.keys())
+
+    return VerificationResult(
+        missing_meta=missing_meta,
+        missing_hash_files=missing_hash_files,
+        missing_flow_entries=missing_flow_entries,
+    )
 
 
 async def prewarm(args: argparse.Namespace) -> int:
@@ -155,10 +173,10 @@ async def prewarm(args: argparse.Namespace) -> int:
     generator_config_path = Path(args.generator_config).resolve()
     snare_root = Path(args.snare_root).resolve()
     page_dir = snare_root / "pages" / args.page_url
-    meta_path = page_dir / "meta.json"
     seedfile_path = snare_root / "seedfile.txt"
+    flows_path = page_dir / "flows.json"
 
-    runtime_config = load_runtime_config(generator_config_path)
+    runtime_config = set_generator_config(generator_config_path)
     if runtime_config.backend.strip().lower() != "agentic":
         raise ValueError(
             f"GENERATOR.backend in {generator_config_path} is '{runtime_config.backend}', expected 'agentic'"
@@ -170,6 +188,7 @@ async def prewarm(args: argparse.Namespace) -> int:
 
     meta = load_meta(meta_path)
     ensure_baseline_meta(meta, index_page)
+    flows = load_flows(flows_path)
 
     if args.write_seedfile:
         write_seedfile(seedfile_path, endpoints)
@@ -184,10 +203,12 @@ async def prewarm(args: argparse.Namespace) -> int:
         "path_collisions": 0,
         "path_collision_skips": 0,
         "path_collision_overwrites": 0,
+        "flows_written": 0,
     }
 
     generator = AgenticBundleGenerator(runtime_config=runtime_config)
     collisions: list[dict[str, str]] = []
+    flow_paths_seen: set[str] = set()
 
     if not args.check_only:
         for endpoint in endpoints:
@@ -252,6 +273,12 @@ async def prewarm(args: argparse.Namespace) -> int:
                     (page_dir / digest).write_bytes(body)
                     meta[artifact_path] = {"hash": digest, "headers": headers}
                     written_this_endpoint += 1
+                flow_descriptor = getattr(bundle, "flow_descriptor", None)
+                if flow_descriptor is not None:
+                    flows[bundle.primary_path] = flow_descriptor.model_dump(mode="json")
+                    flow_paths_seen.add(bundle.primary_path)
+                    write_flows(flows_path, flows)
+                    summary["flows_written"] += 1
                 write_meta(meta_path, meta)
                 summary["generated"] += 1
                 summary["paths_written"] += written_this_endpoint
@@ -260,13 +287,14 @@ async def prewarm(args: argparse.Namespace) -> int:
                 summary["failed"] += 1
                 print(f"[FAIL] {endpoint}: persistence failed {error}")
 
-    verification = verify_cache(meta, page_dir, endpoints)
+    verification = verify_cache(meta, page_dir, endpoints, flows, flow_paths_seen)
 
     print("\n=== PREWARM SUMMARY ===")
     for key, value in summary.items():
         print(f"{key}: {value}")
     print(f"missing_meta_entries: {len(verification.missing_meta)}")
     print(f"missing_hash_files: {len(verification.missing_hash_files)}")
+    print(f"missing_flow_entries: {len(verification.missing_flow_entries)}")
 
     if verification.missing_meta:
         print("\nMissing meta entries:")
@@ -277,6 +305,11 @@ async def prewarm(args: argparse.Namespace) -> int:
         print("\nMissing hash files:")
         for issue in verification.missing_hash_files[:30]:
             print(f"  - {issue}")
+
+    if verification.missing_flow_entries:
+        print("\nMissing flow entries:")
+        for path in verification.missing_flow_entries[:30]:
+            print(f"  - {path}")
     if collisions:
         print("\nPath collisions:")
         for collision in collisions[:50]:
@@ -293,6 +326,7 @@ async def prewarm(args: argparse.Namespace) -> int:
         or summary["path_collision_skips"] > 0
         or bool(verification.missing_meta)
         or bool(verification.missing_hash_files)
+        or bool(verification.missing_flow_entries)
     )
 
 
@@ -311,7 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--generator-config",
         default="/home/kaan/dynamic-honey/tanner/tanner/data/config.v1-smoketest.yaml",
-        help="Path to Tanner YAML config with GENERATOR settings to mirror smoketest behavior.",
+        help=(
+            "Path to Tanner YAML config with GENERATOR settings. Determines V1 vs V2: "
+            "config.v1-smoketest.yaml (enable_scripted_flows=false) or "
+            "config.v2-smoketest.yaml (enable_scripted_flows=true, v2_overrides applied)."
+        ),
     )
     parser.add_argument(
         "--snare-root",

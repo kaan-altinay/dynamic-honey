@@ -460,6 +460,12 @@ class FlowRule(ModelBase):
     condition: FlowCondition | None = None        # None = always matches this path
     response: FlowResponse
     priority: int = 0
+    # Path of the /_flow/ artifact that defined this rule (first-class metadata
+    # or variant-name convention). Distinct from response.artifact_path: a
+    # redirect_to-only rule still has a source artifact even though it serves
+    # no content of its own. Used by diagnose_flow_reachability to recognize
+    # such artifacts as intentionally tied in rather than orphaned.
+    source_artifact_path: str | None = None
 
 
 class FlowDescriptor(ModelBase):

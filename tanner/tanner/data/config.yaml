@@ -84,6 +84,26 @@ GENERATOR:
     review:
       temperature: 0.0
       max_tokens: 1600
+  v2_overrides:
+    # Applied automatically whenever enable_scripted_flows=true.
+    # Tuned V2 defaults from the parameter sweep.
+    max_review_loops: 1
+    max_design_validation_loops: 2
+    max_bundle_artifacts: 8
+    max_bundle_bytes: 2000000
+    roles:
+      expert:
+        temperature: 0.0
+        max_tokens: 1800
+      design:
+        temperature: 0.1
+        max_tokens: 2400
+      coder:
+        temperature: 0.1
+        max_tokens: 1600
+      review:
+        temperature: 0.0
+        max_tokens: 1600
 
 EMULATORS:
   root_dir: /opt/tanner

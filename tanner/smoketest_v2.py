@@ -30,28 +30,20 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import unquote
 
+from tanner.config import TannerConfig
 from tanner.flow.flow_evaluator import FlowEvaluator, FlowMatchResult
-from tanner.generator.agentic.models import (
-    FlowDescriptor,
-    GeneratorRoleConfig,
-    GeneratorRuntimeConfig,
-)
+from tanner.generator.agentic.config import load_runtime_config
+from tanner.generator.agentic.models import FlowDescriptor, GeneratorRuntimeConfig
 from tanner.generator.agentic.workflow import AgenticBundleGenerator
+
+# This script always runs the V2 (scripted-flows) generator. Tuned values
+# live in GENERATOR.v2_overrides in this file -- the same single source of
+# truth merged by load_runtime_config() for the real server, kept in sync
+# with tanner/tanner/data/config.yaml's GENERATOR.v2_overrides.
+_V2_SMOKETEST_CONFIG_PATH = Path(__file__).resolve().parent / "tanner" / "data" / "config.v2-smoketest.yaml"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-def role(model: str, temperature: float, max_tokens: int) -> GeneratorRoleConfig:
-    return GeneratorRoleConfig(
-        provider="openai",
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=120,
-        max_retries=1,
-    )
-
-
 
 def _normalize_path(path: str) -> str:
     normalized = (path or "").split("?", 1)[0]
@@ -64,32 +56,15 @@ def _normalize_path(path: str) -> str:
 
 
 def build_smoketest_config(model_name: str = "gpt-5.4") -> GeneratorRuntimeConfig:
-    return GeneratorRuntimeConfig(
-        backend="agentic",
-        enable_scripted_flows=True,          # V2
-        max_review_loops=1,
-        max_bundle_artifacts=8,
-        max_bundle_bytes=2_000_000,
-        checkpoint_path="/tmp/tanner-agentic-v2-smoketest.sqlite",
-        graph_recursion_limit=200,
-        review_log_path="/tmp/tanner-agentic-v2-review-log.json",
-        enable_live_research=True,
-        max_tool_response_chars=4_000,
-        max_command_output_chars=2_000,
-        command_timeout=2,
-        max_concurrent_model_calls=1,
-        inter_call_delay_seconds=12.5,
-        max_rate_limit_retries=3,
-        default_rate_limit_backoff_seconds=12.0,
-        max_length_limit_retries=3,
-        length_retry_token_increase=800,
-        max_length_retry_tokens=6_000,
-        roles={
-            "expert": role(model_name, 0.0, 1800),
-            "design": role(model_name, 0.0, 2800),
-            "coder": role(model_name, 0.1, 1600),
-            "review": role(model_name, 0.0, 1600),
-        },
+    TannerConfig.set_config(str(_V2_SMOKETEST_CONFIG_PATH))
+    cfg = load_runtime_config()
+    return cfg.model_copy(
+        update={
+            "roles": {
+                name: role_cfg.model_copy(update={"model": model_name})
+                for name, role_cfg in cfg.roles.items()
+            }
+        }
     )
 
 

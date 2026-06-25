@@ -84,3 +84,58 @@ class TestAgenticGeneratorConfig(unittest.TestCase):
             max_tokens=600,
             max_retries=4,
         )
+
+
+class TestAgenticGeneratorV2Overrides(unittest.TestCase):
+    @staticmethod
+    def _config_get(section, value):
+        values = {
+            ("GENERATOR", "backend"): "agentic",
+            ("GENERATOR", "enable_scripted_flows"): True,
+            ("GENERATOR", "max_review_loops"): 1,
+            ("GENERATOR", "max_design_validation_loops"): 2,
+            ("GENERATOR", "max_bundle_artifacts"): 8,
+            ("GENERATOR", "max_bundle_bytes"): 2_000_000,
+            ("GENERATOR", "role_defaults"): {
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "temperature": 0.2,
+                "max_tokens": 900,
+                "timeout": 120,
+                "max_retries": 1,
+            },
+            ("GENERATOR", "roles"): {
+                "expert": {"temperature": 0.0, "max_tokens": 1800},
+                "design": {"temperature": 0.0, "max_tokens": 2800},
+                "coder": {"temperature": 0.1, "max_tokens": 1600},
+                "review": {"temperature": 0.0, "max_tokens": 1600},
+            },
+            ("GENERATOR", "v2_overrides"): {
+                "max_review_loops": 1,
+                "max_design_validation_loops": 2,
+                "max_bundle_artifacts": 8,
+                "max_bundle_bytes": 2_000_000,
+                "roles": {
+                    "expert": {"temperature": 0.0, "max_tokens": 1800},
+                    "design": {"temperature": 0.1, "max_tokens": 2400},
+                    "coder": {"temperature": 0.1, "max_tokens": 1600},
+                    "review": {"temperature": 0.0, "max_tokens": 1600},
+                },
+            },
+        }
+        return values.get((section, value))
+
+    def test_scripted_flows_enable_v2_tuned_overrides(self):
+        with mock.patch("tanner.generator.agentic.config.TannerConfig.get", side_effect=self._config_get):
+            runtime_config = load_runtime_config()
+        self.assertTrue(runtime_config.enable_scripted_flows)
+        self.assertEqual(runtime_config.max_bundle_artifacts, 8)
+        self.assertEqual(runtime_config.max_bundle_bytes, 2_000_000)
+        self.assertEqual(runtime_config.max_review_loops, 1)
+        self.assertEqual(runtime_config.max_design_validation_loops, 2)
+        self.assertEqual(runtime_config.role_config("expert").temperature, 0.0)
+        self.assertEqual(runtime_config.role_config("design").temperature, 0.1)
+        self.assertEqual(runtime_config.role_config("design").max_tokens, 2400)
+        self.assertEqual(runtime_config.role_config("coder").temperature, 0.1)
+        self.assertEqual(runtime_config.role_config("coder").max_tokens, 1600)
+        self.assertEqual(runtime_config.role_config("review").temperature, 0.0)
