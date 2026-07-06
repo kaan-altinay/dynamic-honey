@@ -173,6 +173,7 @@ async def prewarm(args: argparse.Namespace) -> int:
     generator_config_path = Path(args.generator_config).resolve()
     snare_root = Path(args.snare_root).resolve()
     page_dir = snare_root / "pages" / args.page_url
+    meta_path = page_dir / "meta.json"
     seedfile_path = snare_root / "seedfile.txt"
     flows_path = page_dir / "flows.json"
 
@@ -204,11 +205,13 @@ async def prewarm(args: argparse.Namespace) -> int:
         "path_collision_skips": 0,
         "path_collision_overwrites": 0,
         "flows_written": 0,
+        "used_fallback": 0,
     }
 
     generator = AgenticBundleGenerator(runtime_config=runtime_config)
     collisions: list[dict[str, str]] = []
     flow_paths_seen: set[str] = set()
+    fallback_endpoints: list[str] = []
 
     if not args.check_only:
         for endpoint in endpoints:
@@ -282,7 +285,12 @@ async def prewarm(args: argparse.Namespace) -> int:
                 write_meta(meta_path, meta)
                 summary["generated"] += 1
                 summary["paths_written"] += written_this_endpoint
-                print(f"[OK] {endpoint}: wrote {written_this_endpoint} artifact paths")
+                used_fallback = bool(getattr(bundle, "used_fallback", False))
+                if used_fallback:
+                    summary["used_fallback"] += 1
+                    fallback_endpoints.append(endpoint)
+                fallback_tag = " [FALLBACK]" if used_fallback else ""
+                print(f"[OK] {endpoint}: wrote {written_this_endpoint} artifact paths{fallback_tag}")
             except Exception as error:  # noqa: BLE001
                 summary["failed"] += 1
                 print(f"[FAIL] {endpoint}: persistence failed {error}")
@@ -295,6 +303,12 @@ async def prewarm(args: argparse.Namespace) -> int:
     print(f"missing_meta_entries: {len(verification.missing_meta)}")
     print(f"missing_hash_files: {len(verification.missing_hash_files)}")
     print(f"missing_flow_entries: {len(verification.missing_flow_entries)}")
+
+    if fallback_endpoints:
+        print(f"\n{len(fallback_endpoints)} endpoint(s) used the heuristic fallback generator, not the LLM coder:")
+        for endpoint in fallback_endpoints[:30]:
+            print(f"  - {endpoint}")
+        print("  Re-run with --force on just these paths once rate limits clear to get real LLM-generated content.")
 
     if verification.missing_meta:
         print("\nMissing meta entries:")

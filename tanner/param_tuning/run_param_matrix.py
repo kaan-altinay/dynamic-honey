@@ -37,7 +37,7 @@ FAMILY_VALUES = {
     "C": {
         "description": "Review loop depth",
         "axes": {
-            "max_review_loops": [1, 2],
+            "max_review_loops": [1, 2, 3],
             "max_design_validation_loops": [2, 3],
         },
     },

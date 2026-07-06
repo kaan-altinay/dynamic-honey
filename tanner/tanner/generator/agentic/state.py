@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, TypedDict
+from typing import Annotated, Optional, TypedDict
 
 from tanner.generator.agentic.models import (
     ArtifactDraft,
@@ -32,4 +32,10 @@ class GraphState(TypedDict, total=False):
     errors: Annotated[list[str], operator.add]
     generation_diagnostics: Annotated[list[dict], operator.add]
     plan_revision: int
-    flow_descriptor: dict | None  # serialized FlowDescriptor when V2 active
+    flow_descriptor: Optional[dict]  # serialized FlowDescriptor when V2 active
+    # Least-defective bundle/score seen across this endpoint's review
+    # iterations so far -- preferred over the LATEST attempt if review-loop
+    # budget exhaustion forces an approval (LLM retries are not guaranteed
+    # to be monotonically improving). Set/read only in reviewer.py.
+    best_bundle: GeneratedBundle
+    best_bundle_score: int

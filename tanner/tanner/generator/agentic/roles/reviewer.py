@@ -107,7 +107,9 @@ class ReviewerRoleMixin:
             source=review_source,
         )
 
-        # Let the LLM review verdict stand - it has veto power over quality defects
+        # The LLM review verdict has veto power over quality defects, but — like
+        # structural-validation rejections above — must respect max_review_loops so
+        # it cannot loop indefinitely against the graph_recursion_limit ceiling.
         if decision.decision != "approve":
             self.logger.info(
                 "Review rejected bundle for %s with decision '%s': %s",
@@ -115,12 +117,44 @@ class ReviewerRoleMixin:
                 decision.decision,
                 decision.reasons or decision.required_fixes,
             )
+            # LLM retries are not monotonically improving (param-tuning family C
+            # run6's /.env regressed from a placeholder-secrets draft to a bare
+            # "Sensitive configuration withheld" stub on its second attempt).
+            # Track the least-defective draft seen so far across this
+            # endpoint's review iterations, scored by how many issues the
+            # reviewer flagged, and prefer it over whatever the LATEST attempt
+            # produced if budget exhaustion forces an approval here.
+            current_score = len(decision.reasons) + len(decision.required_fixes)
+            best_score = state.get("best_bundle_score")
+            current_is_best = best_score is None or current_score < best_score
+            extra = self._review_revise_or_fallback(
+                state,
+                decision.reasons or decision.required_fixes,
+                hard_failure=False,
+            )
+            if extra["review_decision"].decision == "approve" and not current_is_best:
+                extra["generated_bundle"] = state["best_bundle"]
+                extra["trace_notes"] = extra["trace_notes"] + ["review:retained_best_of_iterations"]
+            else:
+                extra["generated_bundle"] = bundle
+            if current_is_best:
+                extra["best_bundle"] = bundle
+                extra["best_bundle_score"] = current_score
+            diagnostics = list(trim_diagnostics)
+            diagnostics.append(
+                self._diagnostic_event(
+                    "review", "quality_rejection", request.normalized_path,
+                    "; ".join(decision.reasons[:3]),
+                    required_fixes=decision.required_fixes[:3],
+                )
+            )
+            extra["generation_diagnostics"] = diagnostics
+            return extra
 
-        trace_decision = decision.decision if decision.decision == "approve" else "quality_defect:{}".format(decision.decision)
         extra: dict = {
             "generated_bundle": bundle,
             "review_decision": decision,
-            "trace_notes": ["review:{}".format(trace_decision)],
+            "trace_notes": ["review:approve"],
         }
         diagnostics = list(trim_diagnostics)
         if review_source == "deterministic":
@@ -135,14 +169,6 @@ class ReviewerRoleMixin:
                 self._diagnostic_event(
                     "review", "deterministic_fallback", request.normalized_path,
                     "model review call failed; deterministic approval applied",
-                )
-            )
-        elif decision.decision != "approve":
-            diagnostics.append(
-                self._diagnostic_event(
-                    "review", "quality_rejection", request.normalized_path,
-                    "; ".join(decision.reasons[:3]),
-                    required_fixes=decision.required_fixes[:3],
                 )
             )
         if diagnostics:

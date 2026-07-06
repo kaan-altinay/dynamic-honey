@@ -1,15 +1,15 @@
 prompts:
   expert:
     system_v1: |-
-      You are the Expert role in a honeypot resource generator.
-        "Infer attacker intent from the requested path and return a concise structured spec.\n\n"
-        "Intent families (choose one):\n"
-        "- config_theft: Attacker seeks leaked configuration files with credentials/secrets\n"
-        "- cms_probe: Attacker probes for CMS admin login surfaces (WordPress, Drupal, etc.)\n"
-        "- admin_portal: Attacker seeks generic administrative dashboards or control panels\n"
-        "- framework_probe: Attacker enumerates framework-specific resources (Laravel, Django, etc.)\n"
-        "- backup_probe: Attacker searches for backup archives, manifests, or export listings\n"
-        "- generic_recon: General reconnaissance of service structure and nearby resources"
+      You are the Expert role in a honeypot resource generator. Infer attacker intent from the requested path and return a concise structured spec.
+
+        Intent families (choose one):
+        - config_theft: Attacker seeks leaked configuration files with credentials/secrets
+        - cms_probe: Attacker probes for CMS admin login surfaces (WordPress, Drupal, etc.)
+        - admin_portal: Attacker seeks generic administrative dashboards or control panels
+        - framework_probe: Attacker enumerates framework-specific resources (Laravel, Django, etc.)
+        - backup_probe: Attacker searches for backup archives, manifests, or export listings
+        - generic_recon: General reconnaissance of service structure and nearby resources
     system_v2: |-
       You are the Expert role in a content-generation pipeline. Infer the visitor's likely intent from the requested path and return a concise structured spec.
 
@@ -241,6 +241,7 @@ prompts:
         - headers_hint: must be a list of {{name, value}} objects
         - Do not invent file paths not provided in the allowed lists
         - If this artifact path starts with /_flow/, make the visible content match the flow behavior described in purpose and flow metadata; do not make a generic page that hides the conditional response.
+        - NEVER render a /_flow/ path as a literal href, src, redirect, or JS string in visible output, even if you can infer one exists from flow metadata -- it is a server-internal routing key the flow evaluator resolves server-side, not a real URL a user would see or click.
     system_v2: |-
       You are a Coder role generating one static artifact draft for a content-generation pipeline.
 
@@ -253,6 +254,7 @@ prompts:
       - headers_hint: must be a list of {{name, value}} objects
       - Do not invent file paths not provided in the allowed lists
       - If this artifact path starts with /_flow/, make the visible content match the flow behavior described in purpose and flow metadata; do not make a generic page that hides the conditional response.
+      - NEVER render a /_flow/ path as a literal href, src, redirect, or JS string in visible output, even if you can infer one exists from flow metadata -- it is a server-internal routing key the flow evaluator resolves server-side, not a real URL a user would see or click.
     user_v1: |-
       artifact_id: {artifact_id} (echo this exactly)
       path: {artifact_path} (echo this exactly)

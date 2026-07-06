@@ -16,8 +16,28 @@ from bs4 import BeautifulSoup
 from snare.html_handler import HtmlHandler
 
 
-META_JOB_POLL_INTERVAL_SECONDS = 1.0
+META_JOB_POLL_INTERVAL_SECONDS = 3.0
 META_JOB_MAX_ATTEMPTS = 600
+
+# Headers that exist purely for internal bookkeeping (e.g. tagging which
+# generator produced an artifact) and must never reach a real HTTP response
+# -- they'd let an attacker trivially fingerprint generated content. Old
+# cached meta.json entries may already carry these; filtering here (the
+# single choke point all served responses pass through) covers both
+# already-persisted caches and anything generated going forward, with no
+# need to rewrite any cache files.
+_INTERNAL_ONLY_HEADERS = ("X-Tanner-Generated",)
+
+# Internal flow-bookkeeping path prefix. Artifacts under /_flow/ are
+# server-internal routing keys the V2 flow evaluator uses to look up which
+# variant to serve next (e.g. /_flow/boaform-admin-formLogin/post-invalid)
+# -- they were never meant to be literal, attacker-visible URLs. Some
+# already-persisted bundles nonetheless link to them directly from rendered
+# HTML/JS (nav links, redirect scripts), which is itself a honeypot tell.
+# Stripping the prefix at the same single choke point as the header
+# filtering above sanitizes both already-cached content and anything
+# generated going forward, with no need to rewrite any cache files.
+_INTERNAL_FLOW_PATH_PREFIX = "/_flow/"
 
 
 class TannerHandler:
@@ -575,4 +595,22 @@ class TannerHandler:
                 else:
                     status_code = 404
 
+        for header_name in _INTERNAL_ONLY_HEADERS:
+            headers.popall(header_name, None)
+        content = self._strip_internal_flow_references(content)
         return content, headers, status_code
+
+    @staticmethod
+    def _strip_internal_flow_references(content):
+        """Remove the /_flow/ internal-routing prefix from served content.
+
+        Applied unconditionally to every response leaving parse_tanner_response
+        (cache hits and freshly generated content alike) so a leaked literal
+        reference -- e.g. an <a href="/_flow/foo/post-invalid"> nav link or an
+        inline redirect script -- never reaches the client as-is.
+        """
+        if isinstance(content, bytes):
+            return content.replace(_INTERNAL_FLOW_PATH_PREFIX.encode("utf-8"), b"/")
+        if isinstance(content, str):
+            return content.replace(_INTERNAL_FLOW_PATH_PREFIX, "/")
+        return content

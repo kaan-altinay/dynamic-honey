@@ -123,6 +123,48 @@ class TestParseTannerResponse(unittest.TestCase):
         expected_result = [self.expected_content, self.headers, self.status_code]
         self.assertCountEqual(real_result, expected_result)
 
+    def test_parse_type_one_strips_internal_tanner_generated_header(self):
+        self.requested_name = "/index.html"
+        self.handler.meta["/index.html"]["headers"] = [
+            {"Content-Type": "text/html"},
+            {"X-Tanner-Generated": "agentic"},
+        ]
+        self.detection = {"type": 1}
+
+        async def test():
+            (
+                self.res1,
+                self.res2,
+                self.res3,
+            ) = await self.handler.parse_tanner_response(self.requested_name, self.detection)
+
+        self.loop.run_until_complete(test())
+        self.assertNotIn("X-Tanner-Generated", self.res2)
+        self.assertEqual(self.res2.get("Content-Type"), "text/html")
+
+    def test_parse_type_one_strips_internal_flow_path_prefix(self):
+        leaked_content = b'<a href="/_flow/boaform-admin-formLogin/post-invalid">Invalid Login</a>'
+        self.handler.meta["/boaform/admin/formLogin"] = {
+            "hash": "flow_leak_hash",
+            "headers": [{"Content-Type": "text/html"}],
+        }
+        with open(os.path.join(self.main_page_path, "flow_leak_hash"), "wb") as f:
+            f.write(leaked_content)
+        self.handler.html_handler.handle_content = AsyncMock(side_effect=lambda content: content)
+        self.requested_name = "/boaform/admin/formLogin"
+        self.detection = {"type": 1}
+
+        async def test():
+            (
+                self.res1,
+                self.res2,
+                self.res3,
+            ) = await self.handler.parse_tanner_response(self.requested_name, self.detection)
+
+        self.loop.run_until_complete(test())
+        self.assertNotIn(b"/_flow/", self.res1)
+        self.assertIn(b'href="/boaform-admin-formLogin/post-invalid"', self.res1)
+
     def test_parse_type_two(self):
         self.detection = {
             "type": 2,

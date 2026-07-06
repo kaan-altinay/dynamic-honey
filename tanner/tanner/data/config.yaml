@@ -86,8 +86,8 @@ GENERATOR:
       max_tokens: 1600
   v2_overrides:
     # Applied automatically whenever enable_scripted_flows=true.
-    # Tuned V2 defaults from the parameter sweep.
-    max_review_loops: 1
+    # Tuned V2 defaults from the hyperparameter tuning results.
+    max_review_loops: 3
     max_design_validation_loops: 2
     max_bundle_artifacts: 8
     max_bundle_bytes: 2000000

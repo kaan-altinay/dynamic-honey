@@ -148,6 +148,7 @@ if __name__ == '__main__':
     parser.add_argument("--no-dorks", help="disable the use of dorks", type=str_to_bool,  default=True)
     parser.add_argument("--path", help="path to save the page to be cloned", required=False, default='/opt/')
     parser.add_argument("--seed-endpoints", help="file with list of endpoints to be generated", default="seedfile.txt")
+    parser.add_argument("--spoof-200", help="serve an empty HTTP 200 to every request without contacting Tanner", type=str_to_bool, default=str_to_bool(os.environ.get("SPOOF_200", "false")))
 
     args = parser.parse_args()
     base_path = os.path.join(args.path, 'snare')
@@ -204,7 +205,10 @@ if __name__ == '__main__':
     else:
         snare_helpers.add_meta_tag(args.page_dir, meta_info[args.index_page]['hash'], config, base_path)
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(check_tanner())
+    if args.spoof_200:
+        print_color('--spoof-200 enabled: skipping Tanner version check, Tanner is not required', 'INFO')
+    else:
+        loop.run_until_complete(check_tanner())
 
     pool = ProcessPoolExecutor(max_workers=multiprocessing.cpu_count())
     compare_version_fut = None
@@ -214,7 +218,12 @@ if __name__ == '__main__':
 
     app = HttpRequestHandler(meta_info, args, snare_uuid, debug=args.debug, keep_alive=75)
     seed_endpoints = app.tanner_handler.parse_seed_endpoints(args.seed_endpoints)
-    if seed_endpoints:
+    if seed_endpoints and args.spoof_200:
+        app.tanner_handler.logger.info(
+            "--spoof-200 enabled: skipping seed endpoint generation for %s endpoints (Tanner is not required)",
+            len(seed_endpoints),
+        )
+    elif seed_endpoints:
         app.tanner_handler.logger.info(
             "Loaded %s seed endpoints from %s",
             len(seed_endpoints),

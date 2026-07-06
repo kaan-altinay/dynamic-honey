@@ -50,6 +50,49 @@ class AlwaysReviseGenerator(NoModelGenerator):
         return self._review_revise_or_fallback(state, ["forced revise"])
 
 
+class AlwaysQualitativeReviseGenerator(NoModelGenerator):
+    """Forces the REAL ``_review_node`` body to take its LLM-veto ("quality_defect")
+    branch every time, instead of mocking ``_review_node`` away like
+    ``AlwaysReviseGenerator`` does. Regression test for the bug where that branch
+    bypassed ``max_review_loops`` entirely and looped until ``graph_recursion_limit``."""
+
+    def __init__(self, runtime_config):
+        self.review_model_calls = 0
+        super().__init__(runtime_config=runtime_config)
+
+    async def _invoke_structured(self, role_name, schema, messages):
+        assert role_name == "review", "test only drives _review_node directly"
+        self.review_model_calls += 1
+        return {
+            "decision": "revise",
+            "reasons": ["needs more detail"],
+            "required_fixes": ["add more detail"],
+        }
+
+
+class RegressingQualitativeReviseGenerator(NoModelGenerator):
+    """Each call returns a worse (more-reasons) "revise" verdict than the last --
+    simulating an LLM retry that regresses instead of improving (the exact
+    failure mode observed in param-tuning family C run6's /.env bundle, where
+    attempt 2 replaced placeholder-flagged-but-real secrets with a bare
+    "Sensitive configuration withheld" stub). Regression test for retaining
+    the least-defective draft across iterations instead of always the latest."""
+
+    def __init__(self, runtime_config):
+        self.review_model_calls = 0
+        super().__init__(runtime_config=runtime_config)
+
+    async def _invoke_structured(self, role_name, schema, messages):
+        assert role_name == "review", "test only drives _review_node directly"
+        self.review_model_calls += 1
+        reason_count = self.review_model_calls  # 1 reason, then 2, then 3, ...
+        return {
+            "decision": "revise",
+            "reasons": ["issue {}".format(i) for i in range(reason_count)],
+            "required_fixes": [],
+        }
+
+
 class TestAgenticBundleGenerator(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()
@@ -814,6 +857,107 @@ class TestAgenticBundleGenerator(unittest.TestCase):
         self.assertEqual(bundle.primary_path, "/admin/login")
         self.assertEqual(generator.review_calls, 2)
         self.assertIn("review loop budget exhausted", bundle.review_summary)
+
+    def test_qualitative_review_veto_respects_max_review_loops(self):
+        generator = AlwaysQualitativeReviseGenerator(
+            runtime_config=self._runtime_config(max_review_loops=2, enable_scripted_flows=False)
+        )
+        request = ensure_generation_request("example.com", "/wp-admin/login.php", {"index_page": "/index.html"})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+        bundle = GeneratedBundle(
+            primary_path="/wp-admin/login.php",
+            artifacts=[
+                GeneratedArtifact(
+                    path="/wp-admin/login.php",
+                    kind="html_page",
+                    headers=[{"Content-Type": "text/html; charset=utf-8"}],
+                    body_bytes=b'<html><body><a href="/index.html">Home</a></body></html>',
+                    status_code=200,
+                    source_artifact_id="page",
+                    artifact_scope="static_file",
+                )
+            ],
+            review_summary="pending",
+            used_fallback=False,
+        )
+        state = {
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "generated_bundle": bundle.model_dump(mode="json"),
+            "errors": [],
+            "review_iteration": 0,
+        }
+
+        first = self.loop.run_until_complete(generator._review_node(state))
+        self.assertEqual(first["review_decision"].decision, "revise")
+        self.assertEqual(first["review_iteration"], 1)
+
+        state.update(first)
+        second = self.loop.run_until_complete(generator._review_node(state))
+
+        # Budget (max_review_loops=2) is exhausted on the second LLM "revise"
+        # verdict: the loop MUST stop here instead of bouncing back to design_node
+        # indefinitely (the bug let this run until graph_recursion_limit, e.g. 200).
+        self.assertEqual(generator.review_model_calls, 2)
+        self.assertEqual(second["review_decision"].decision, "approve")
+        self.assertEqual(second["review_iteration"], 2)
+        self.assertIn("review loop budget exhausted", second["review_decision"].reasons[0])
+
+    def test_review_loop_retains_best_bundle_not_latest_on_regression(self):
+        generator = RegressingQualitativeReviseGenerator(
+            runtime_config=self._runtime_config(max_review_loops=2, enable_scripted_flows=False)
+        )
+        request = ensure_generation_request("example.com", "/admin/login", {"index_page": "/index.html"})
+        expert_spec = self.loop.run_until_complete(generator._heuristic_expert_spec(request))
+        resource_plan = generator._heuristic_plan(request, expert_spec)
+
+        def make_bundle(body: bytes) -> GeneratedBundle:
+            return GeneratedBundle(
+                primary_path="/admin/login",
+                artifacts=[
+                    GeneratedArtifact(
+                        path="/admin/login",
+                        kind="html_page",
+                        headers=[{"Content-Type": "text/html; charset=utf-8"}],
+                        body_bytes=body,
+                        status_code=200,
+                        source_artifact_id="page",
+                        artifact_scope="static_file",
+                    )
+                ],
+                review_summary="pending",
+                used_fallback=False,
+            )
+
+        bundle_v1 = make_bundle(b"<html><body><h1>Admin Login</h1></body></html>\n")  # flagged, but real content
+        state = {
+            "request": request,
+            "expert_spec": expert_spec,
+            "resource_plan": resource_plan,
+            "generated_bundle": bundle_v1.model_dump(mode="json"),
+            "errors": [],
+            "review_iteration": 0,
+        }
+        first = self.loop.run_until_complete(generator._review_node(state))
+        self.assertEqual(first["review_decision"].decision, "revise")
+        self.assertEqual(GeneratedBundle.model_validate(first["best_bundle"]).artifacts[0].body_bytes, bundle_v1.artifacts[0].body_bytes)
+
+        # Second attempt regresses: more issues flagged AND materially worse content.
+        bundle_v2 = make_bundle(b"<!-- Sensitive content withheld -->\n")
+        state.update(first)
+        state["generated_bundle"] = bundle_v2.model_dump(mode="json")
+        second = self.loop.run_until_complete(generator._review_node(state))
+
+        self.assertEqual(generator.review_model_calls, 2)
+        self.assertEqual(second["review_decision"].decision, "approve")
+        final_bundle = GeneratedBundle.model_validate(second["generated_bundle"])
+        # Budget exhausted on the WORSE attempt -- must ship bundle_v1 (fewer
+        # flagged issues), not bundle_v2 (the latest, regressed attempt).
+        self.assertEqual(final_bundle.artifacts[0].body_bytes, bundle_v1.artifacts[0].body_bytes)
+        self.assertIn("review:retained_best_of_iterations", second["trace_notes"])
+
 
 
     def test_review_loop_hard_failures_fall_back_after_max_review_loops(self):

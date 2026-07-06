@@ -201,20 +201,10 @@ class TannerServer:
         return base_generator.BaseGenerator()
 
     def _is_flows_enabled(self):
-        if not isinstance(self.generator, AgenticBundleGenerator):
-            return False
         try:
-            raw_value = TannerConfig.get("GENERATOR", "enable_scripted_flows")
+            return TannerConfig.get("GENERATOR", "enable_scripted_flows")
         except KeyError:
             return False
-
-        if isinstance(raw_value, bool):
-            return raw_value
-        if isinstance(raw_value, (int, float)):
-            return raw_value != 0
-        if isinstance(raw_value, str):
-            return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-        return False
 
     @staticmethod
     def _make_response(msg):

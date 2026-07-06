@@ -9,6 +9,8 @@ setup(
     author_email="glastopf@public.honeynet.org",
     url="https://github.com/mushorg/tanner",
     packages=find_packages(exclude=["*.pyc"]),
+    package_data={"tanner.generator.agentic": ["data/*.yaml"]},
+    include_package_data=True,
     scripts=["bin/tanner", "bin/tannerweb", "bin/tannerapi"],
     data_files=[
         ("/opt/tanner/db/", ["tanner/data/db_config.json", "tanner/data/GeoLite2-City.mmdb"]),

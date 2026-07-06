@@ -66,11 +66,20 @@ class CoderRoleMixin:
             if artifact_reference_context is not None and artifact_reference_context.allowed_local_asset_paths
             else local_asset_paths
         )
-        allowed_internal_paths = (
-            artifact_reference_context.allowed_internal_paths
-            if artifact_reference_context is not None and artifact_reference_context.allowed_internal_paths
-            else [planned.path for planned in resource_plan.artifacts]
-        )
+        # /_flow/ artifacts are server-internal routing keys for the flow
+        # evaluator, never real navigable URLs -- never offer them to the
+        # coder as a path it "may reference" (i.e. literally link/redirect
+        # to from rendered content). See validate_generated_artifact's
+        # _INTERNAL_FLOW_PATH_RE check for the corresponding backstop.
+        allowed_internal_paths = [
+            path
+            for path in (
+                artifact_reference_context.allowed_internal_paths
+                if artifact_reference_context is not None and artifact_reference_context.allowed_internal_paths
+                else [planned.path for planned in resource_plan.artifacts]
+            )
+            if not path.startswith("/_flow/")
+        ]
         primary_path = artifact_reference_context.primary_path if artifact_reference_context is not None else resource_plan.primary_path
         forbidden_external_assets = (
             artifact_reference_context.forbidden_external_assets if artifact_reference_context is not None else True

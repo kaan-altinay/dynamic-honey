@@ -125,7 +125,9 @@ class FlowDesignerRoleMixin:
                 if source is None:
                     source = self._find_html_form_source_for_target(mutable_artifacts, path, request)
                 if source is not None:
-                    synthetic = self._build_post_fail_variant_artifact(source, fail_variant_path)
+                    synthetic = self._build_post_fail_variant_artifact(
+                        source, fail_variant_path, is_login=self._is_login_path(path)
+                    )
                     mutable_artifacts.append(synthetic)
                     generated_paths.add(fail_variant_path)
 
@@ -158,7 +160,9 @@ class FlowDesignerRoleMixin:
                 if source is None:
                     source = self._find_html_form_source_for_target(mutable_artifacts, path, request)
                 if source is not None:
-                    synthetic = self._build_post_locked_variant_artifact(source, locked_variant_path)
+                    synthetic = self._build_post_locked_variant_artifact(
+                        source, locked_variant_path, is_login=self._is_login_path(path)
+                    )
                     mutable_artifacts.append(synthetic)
                     generated_paths.add(locked_variant_path)
 
@@ -286,12 +290,19 @@ class FlowDesignerRoleMixin:
         return None
 
     @staticmethod
-    def _build_post_locked_variant_artifact(source: GeneratedArtifact, variant_path: str) -> GeneratedArtifact:
+    def _build_post_locked_variant_artifact(
+        source: GeneratedArtifact, variant_path: str, *, is_login: bool
+    ) -> GeneratedArtifact:
         body_text = source.body_bytes.decode("utf-8", errors="replace")
+        lockout_text = (
+            "Too many invalid login attempts. Please wait 1 minute before trying again."
+            if is_login
+            else "Too many requests. Please wait 1 minute before trying again."
+        )
         marker = (
             '<div class="message warning" role="alert">'
-            'Too many invalid login attempts. Please wait 1 minute before trying again.'
-            '</div>'
+            + lockout_text
+            + '</div>'
         )
 
         if "<form" in body_text:
@@ -312,12 +323,19 @@ class FlowDesignerRoleMixin:
         )
 
     @staticmethod
-    def _build_post_fail_variant_artifact(source: GeneratedArtifact, variant_path: str) -> GeneratedArtifact:
+    def _build_post_fail_variant_artifact(
+        source: GeneratedArtifact, variant_path: str, *, is_login: bool
+    ) -> GeneratedArtifact:
         body_text = source.body_bytes.decode("utf-8", errors="replace")
+        failure_text = (
+            "Authentication failed. Please verify your credentials and try again."
+            if is_login
+            else "Request rejected. Please verify your input and try again."
+        )
         marker = (
             '<div class="message error" role="alert">'
-            'Authentication failed. Please verify your credentials and try again.'
-            '</div>'
+            + failure_text
+            + '</div>'
         )
 
         if "<form" in body_text:

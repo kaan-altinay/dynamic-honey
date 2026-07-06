@@ -24,6 +24,14 @@ _JS_PATH_LITERAL_RE = re.compile(r"[\"'](/[^\"'\s?#]+(?:\?[^\"']*)?)[\"']")
 _JS_EXTERNAL_URL_RE = re.compile(r"https?://[^\"'\s)]+", re.I)
 _CONFIG_THEFT_SUPPORT_KINDS = {"config_text", "log_excerpt", "backup_manifest", "credential_bait"}
 _INTERNAL_LANGUAGE_RE = re.compile(r"\b(fake|lure|attacker|attackers|honeypot)\b", re.I)
+# /_flow/ is the server-internal routing namespace the V2 flow evaluator uses
+# to key variant artifacts (e.g. /_flow/boaform-admin-formLogin/post-invalid).
+# It must never appear literally in rendered body content -- e.g. as a nav
+# <a href>, an inline redirect script, or a JSON string value -- since real
+# attacker-facing content would never reference it, and doing so both leaks
+# the generator's internal naming scheme and lets a crawler bypass the
+# intended POST-condition gating by following the link directly.
+_INTERNAL_FLOW_PATH_RE = re.compile(r"/_flow/")
 _BINARY_ASSET_EXTENSIONS = (
     ".ico",
     ".jpg",
@@ -955,6 +963,12 @@ def validate_generated_artifact(
         if internal_term_match is not None:
             raise ValidationError(
                 "generated artifact leaked internal planning language: {}".format(internal_term_match.group(1))
+            )
+        if _INTERNAL_FLOW_PATH_RE.search(decoded_body) is not None:
+            raise ValidationError(
+                "generated artifact {} leaked internal /_flow/ routing path into rendered content".format(
+                    artifact.path
+                )
             )
 
 

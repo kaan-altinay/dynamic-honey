@@ -20,9 +20,13 @@ Commands:
 Options:
   --run-name <name>       Required for start/stop/status. Used as the capture directory name under captures_new/.
                           Example: default_first_run, cache_first_run.
-  --mode <name>           default | agentic | current | cache (default: agentic)
-                          default  -> same source tree, but with GENERATOR.backend forced to none via temp config.
+  --mode <name>           default | agentic | agentic-v2 | spoof200 | current | cache (default: agentic)
+                          default   -> same source tree, but with GENERATOR.backend forced to none via temp config.
                           agentic/current/cache -> use the repo config as-is.
+                          agentic-v2 -> same as agentic, but with GENERATOR.enable_scripted_flows forced true
+                                        in the per-run Tanner config copy.
+                          spoof200  -> Tanner is not started at all; Snare answers every request with an empty
+                                       HTTP 200 OK directly, without contacting Tanner.
   --range <start-end>     Public IP host suffix range, must be a contiguous block of 4 aligned on 16,20,24,28.
                           Example: 16-19
   --range-start <start>   Equivalent shorthand for a 4-IP block. Example: --range-start 16 means 16-19.
@@ -44,6 +48,10 @@ Notes:
     and snare state isolated.
   - The "default" mode disables the agentic backend via a temporary Tanner config overlay. It does not restore a
     pristine upstream source tree; for that you would need a separate clean checkout or image.
+  - The "agentic-v2" mode keeps the normal agentic stack, but flips GENERATOR.enable_scripted_flows=true
+    only in that run's generated Tanner config, so V2 overrides apply without touching the shared base config.
+  - The "spoof200" mode runs Snare standalone: no Tanner/Tanner-web/Tanner-api/Redis/phpox containers are started,
+    and Snare never makes a network call to Tanner for any request.
 EOF
 }
 
@@ -236,11 +244,17 @@ normalize_mode() {
   case "$1" in
     default) echo "default" ;;
     agentic|current|cache) echo "agentic" ;;
+    agentic-v2) echo "agentic-v2" ;;
+    spoof200) echo "spoof200" ;;
     *)
       echo "Unsupported mode: $1" >&2
       exit 1
       ;;
   esac
+}
+
+mode_uses_agentic_backend() {
+  [[ "$1" == "agentic" || "$1" == "agentic-v2" ]]
 }
 
 parse_range() {
@@ -454,6 +468,8 @@ if mode == "default":
     text = re.sub(r'(^\s*backend:\s*).*$','\\1none', text, flags=re.M)
     for emulator_key in ("lfi", "cmd_exec", "template_injection"):
         text = re.sub(rf'(^\s*{re.escape(emulator_key)}:\s*).*$','\\1False', text, flags=re.M)
+elif mode == "agentic-v2":
+    text = re.sub(r'(^\s*enable_scripted_flows:\s*).*$','\\1true', text, flags=re.M)
 text = re.sub(r'(^\s*log_debug:\s*).*$','\\1/var/log/tanner/tanner.log', text, flags=re.M)
 text = re.sub(r'(^\s*log_err:\s*).*$','\\1/var/log/tanner/tanner.err', text, flags=re.M)
 text = re.sub(r'(^\s*REDIS:\s*\n(?:.*\n)*?\s*host:\s*).*$','\\1tanner_redis', text, flags=re.M)
@@ -602,6 +618,28 @@ write_snare_compose() {
     return 0
   fi
 
+  local environment_block="      - TANNER=tanner
+      - PAGE_URL=${PAGE_URL}
+      - PORT=80
+      - PYTHONPATH=/"
+  if [[ "${MODE}" == "spoof200" ]]; then
+    environment_block+=$'\n      - SPOOF_200=true'
+  fi
+
+  # spoof200 never starts Tanner, so Snare's compose project owns the
+  # network outright instead of attaching to one Tanner created.
+  local network_block
+  if [[ "${MODE}" == "spoof200" ]]; then
+    network_block="networks:
+  local:
+    name: ${NETWORK_NAME}"
+  else
+    network_block="networks:
+  local:
+    external: true
+    name: ${NETWORK_NAME}"
+  fi
+
   cat > "$SNARE_COMPOSE_PATH" <<EOF
 version: '2.3'
 services:
@@ -617,24 +655,18 @@ services:
     ports:
 ${ports_block%$'\n'}
     environment:
-      - TANNER=tanner
-      - PAGE_URL=${PAGE_URL}
-      - PORT=80
-      - PYTHONPATH=/
+${environment_block}
     volumes:
       - '${STATE_DIR}:/opt/snare'
       - '${ROOT_DIR}/snare/snare:/snare:ro'
 
-networks:
-  local:
-    external: true
-    name: ${NETWORK_NAME}
+${network_block}
 EOF
 }
 
 
 ensure_cliproxy_for_agentic() {
-  if [[ "${MODE}" != "agentic" || "${CLIPROXY_AUTO}" -ne 1 ]]; then
+  if ! mode_uses_agentic_backend "${MODE}" || [[ "${CLIPROXY_AUTO}" -ne 1 ]]; then
     return 0
   fi
 
@@ -676,7 +708,7 @@ ensure_cliproxy_for_agentic() {
 }
 
 verify_llm_backend_from_tanner_container() {
-  if [[ "${MODE}" != "agentic" ]]; then
+  if ! mode_uses_agentic_backend "${MODE}"; then
     return 0
   fi
 
@@ -688,7 +720,7 @@ verify_llm_backend_from_tanner_container() {
   local backend_url="${OPENAI_BASE_URL:-}"
   local backend_key="${OPENAI_API_KEY:-}"
   if [[ -z "$backend_url" ]]; then
-    echo "OPENAI_BASE_URL is not set for agentic mode" >&2
+    echo "OPENAI_BASE_URL is not set for ${MODE} mode" >&2
     exit 1
   fi
 
@@ -720,7 +752,7 @@ PY
 }
 
 allow_cliproxy_from_tanner_network() {
-  if [[ "${MODE}" != "agentic" ]]; then
+  if ! mode_uses_agentic_backend "${MODE}"; then
     return 0
   fi
 
@@ -871,14 +903,16 @@ start_run() {
   prepare_run_dirs
   seed_snare_state
 
-  if [[ "${MODE}" == "agentic" ]]; then
+  if mode_uses_agentic_backend "${MODE}"; then
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://host.docker.internal:8317/v1}"
     export OPENAI_API_BASE="${OPENAI_API_BASE:-http://host.docker.internal:8317/v1}"
     export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-mor5R6MlcggVCit9qS3XzjqjW4Egc9PCOyZuWZYy1qUrf}"
   fi
 
-  write_tanner_config "$MODE"
-  write_tanner_compose
+  if [[ "${MODE}" != "spoof200" ]]; then
+    write_tanner_config "$MODE"
+    write_tanner_compose
+  fi
   write_snare_compose
   write_run_info
 
@@ -886,22 +920,30 @@ start_run() {
   echo "[info] Capture dir: ${RUN_DIR}"
   echo "[info] Snare state: ${STATE_DIR}"
   echo "[info] Forwarded host ports -> snare:80: ${FORWARD_PORT_LIST[*]}"
-  echo "[info] Tanner web: http://127.0.0.1:${WEB_PORT}"
+  if [[ "${MODE}" == "spoof200" ]]; then
+    echo "[info] Tanner: not started (spoof200 mode answers every request with a bare 200 OK)"
+  else
+    echo "[info] Tanner web: http://127.0.0.1:${WEB_PORT}"
+  fi
   echo "[info] tcpdump filter: ${TCPDUMP_FILTER}"
 
   ensure_cliproxy_for_agentic
 
 
-  run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans
+  if [[ "${MODE}" != "spoof200" ]]; then
+    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" down --remove-orphans
+  fi
   run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" down --remove-orphans
 
-  if [[ "$BUILD" -eq 1 ]]; then
-    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d --build
-  else
-    run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d
+  if [[ "${MODE}" != "spoof200" ]]; then
+    if [[ "$BUILD" -eq 1 ]]; then
+      run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d --build
+    else
+      run_compose -p "$PROJECT_NAME" -f "$TANNER_COMPOSE_PATH" up -d
+    fi
+    allow_cliproxy_from_tanner_network
+    verify_llm_backend_from_tanner_container
   fi
-  allow_cliproxy_from_tanner_network
-  verify_llm_backend_from_tanner_container
 
   if [[ "$BUILD" -eq 1 ]]; then
     run_compose -p "$PROJECT_NAME" -f "$SNARE_COMPOSE_PATH" up -d --build
@@ -931,14 +973,18 @@ stop_run() {
   kill_pid_if_running "${tcpdump_pid:-}"
 
   write_container_logs "$snare_container" "${RUN_DIR}/snare.docker.log"
-  write_container_logs "$tanner_container" "${RUN_DIR}/tanner.docker.log"
-  write_container_logs "$tanner_api_container" "${RUN_DIR}/tanner_api.docker.log"
-  write_container_logs "$tanner_web_container" "${RUN_DIR}/tanner_web.docker.log"
-  write_container_logs "$tanner_redis_container" "${RUN_DIR}/tanner_redis.docker.log"
-  write_container_logs "$tanner_phpox_container" "${RUN_DIR}/tanner_phpox.docker.log"
+  if [[ "${mode}" != "spoof200" ]]; then
+    write_container_logs "$tanner_container" "${RUN_DIR}/tanner.docker.log"
+    write_container_logs "$tanner_api_container" "${RUN_DIR}/tanner_api.docker.log"
+    write_container_logs "$tanner_web_container" "${RUN_DIR}/tanner_web.docker.log"
+    write_container_logs "$tanner_redis_container" "${RUN_DIR}/tanner_redis.docker.log"
+    write_container_logs "$tanner_phpox_container" "${RUN_DIR}/tanner_phpox.docker.log"
+  fi
 
   run_compose -p "$project_name" -f "$snare_compose" down --remove-orphans
-  run_compose -p "$project_name" -f "$tanner_compose" down --remove-orphans
+  if [[ "${mode}" != "spoof200" ]]; then
+    run_compose -p "$project_name" -f "$tanner_compose" down --remove-orphans
+  fi
 
   echo "[ok] Run stopped: ${run_name}"
 }

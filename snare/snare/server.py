@@ -62,6 +62,15 @@ class HttpRequestHandler:
 
     async def handle_request(self, request):
         self.logger.info("Request path: {0}".format(request.path_qs))
+
+        # Spoof-200 mode: respond with an empty 200 OK to every request and
+        # never contact Tanner -- there is nothing for it to decide here.
+        if getattr(self.run_args, "spoof_200", False):
+            headers = {}
+            if self.run_args.server_header:
+                headers["Server"] = self.run_args.server_header
+            return web.Response(body=b"", status=200, headers=headers)
+
         data = self.tanner_handler.create_data(request, 200)
         
         # Meta Probe Logic

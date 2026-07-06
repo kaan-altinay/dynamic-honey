@@ -1,0 +1,8 @@
+/shell                                                                                                                                                                                                                                   
+/cgi-bin                                                                                                                                                                                                                                 
+/language/Swedish                                                                                                                                                                                                                        
+/upl.php                                                                                                                                                                                                                                 
+/1.php                                                                                                                                                                                                                                   
+/password.php                                                                                                                                                                                                                            
+/login                                                                                                                                                                                                                                   
+/favicon.ico 
